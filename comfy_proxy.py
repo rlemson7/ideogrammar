@@ -691,7 +691,9 @@ def _flat_foreground_mask(crop):
             import cv2
             k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
             m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=1)
-            m = cv2.dilate(m, k, iterations=1)
+            # Dilate a little extra so a clip built from this mask sits slightly
+            # outside the ink and never shaves glyph edges (ascenders, thin strokes).
+            m = cv2.dilate(m, k, iterations=2)
         except Exception:
             pass
         return m
@@ -803,16 +805,18 @@ def vectorize_image(img_bytes, elements, options):
                 clip_defs, g_open, g_close = "", "", ""
                 masked_ok = True
                 is_flat_crop = _is_flat(crop, flat_threshold)
-                if use_mask:
+                # A flat crop is all graphic: stripping the background base already
+                # isolates the glyphs/logo, so DON'T clip it — a polygon clip only
+                # risks shaving letter edges (ascenders, thin strokes). Masking is
+                # only needed on a non-flat crop, to cut away the photographic parts.
+                if use_mask and not is_flat_crop:
                     m = _region_mask(crop, backend)
                     frac = float(m.mean()) if m is not None else 1.0
                     polys = _mask_to_polys(m) if m is not None else []
-                    # Clip only when the mask cleanly isolates a foreground. A flat
-                    # crop is all graphic, so even a large mask is fine; a non-flat
-                    # crop (contains photo) is only trusted when the mask selects a
-                    # minority — the ink/logo — not most of the box. Otherwise the
-                    # mask failed to separate graphic from photo.
-                    good = bool(polys) and (frac < 0.9 if is_flat_crop else frac < 0.6)
+                    # Trust the mask only when it isolates a minority foreground (the
+                    # ink/logo); a mask covering most of the box hasn't separated the
+                    # graphic from the photo.
+                    good = bool(polys) and frac < 0.6
                     if good:
                         cid = "vclip%d" % idx
                         clip_defs = '<defs><clipPath id="%s">%s</clipPath></defs>' % (
@@ -843,8 +847,11 @@ def vectorize_image(img_bytes, elements, options):
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=90)
     b64 = base64.b64encode(buf.getvalue()).decode()
-    parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d">' % (W, H, W, H)]
-    parts.append('<image x="0" y="0" width="%d" height="%d" href="data:image/jpeg;base64,%s"/>' % (W, H, b64))
+    # Declare the xlink namespace and reference the embedded raster with
+    # xlink:href — Adobe Illustrator only resolves the namespaced form, while
+    # browsers accept it too (so the in-app preview still works).
+    parts = ['<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="%d" height="%d" viewBox="0 0 %d %d">' % (W, H, W, H)]
+    parts.append('<image x="0" y="0" width="%d" height="%d" xlink:href="data:image/jpeg;base64,%s"/>' % (W, H, b64))
     parts.extend(vec_parts)
     parts.append("</svg>")
     return "".join(parts), stats
