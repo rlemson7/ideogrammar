@@ -3161,7 +3161,14 @@ function deleteSelectedSetup() {
 
 let lastSvgUrl = null;
 function setVecStatus(html, cls) { const s = $("vectorizeStatus"); s.innerHTML = html; s.className = "status" + (cls ? " " + cls : ""); }
-function vectorizeLast() { vectorizeEntry(renderHistory.length - 1); }
+function vectorizeLast() {
+  // Vectorize whatever the inline preview is actually showing — after loading a
+  // setup that's the setup's render, not the most recent one in history. Mirrors
+  // the preview-click handler; falls back to the latest render if the preview
+  // ref isn't in history.
+  const idx = historyIndexOf(previewRenderRef);
+  vectorizeEntry(idx >= 0 ? idx : renderHistory.length - 1);
+}
 async function vectorizeEntry(idx) {
   if (!renderHistory.length) { setVecStatus("Render an image first.", "err"); return; }
   idx = Math.max(0, Math.min(renderHistory.length - 1, idx));

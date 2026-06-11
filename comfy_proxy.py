@@ -669,10 +669,44 @@ def _sam_mask(crop):
         return None
 
 
+def _drop_offshade_blobs(m, lum, tol=45.0):
+    """Drop connected components of a single-shade ink mask whose mean luminance
+    is far (> tol) from the mask's dominant luminance. Used to strip stray
+    bright/dark photo patches that cleared a near-white/near-black threshold but
+    aren't the actual lettering."""
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return m
+    try:
+        n, lab, _, _ = cv2.connectedComponentsWithStats(m, 8)
+        if n <= 2:
+            return m
+        med = float(np.median(lum[m > 0]))
+        out = np.zeros_like(m)
+        for i in range(1, n):
+            comp = lab == i
+            if abs(float(lum[comp].mean()) - med) <= tol:
+                out[comp] = 1
+        return out if out.any() else m
+    except Exception:
+        return m
+
+
 def _flat_foreground_mask(crop):
     # For flat regions (text/logos/flat art) the "ink" is what differs from the
-    # local background. Estimate background from the border pixels, then keep
-    # pixels far from it. Works far better than GrabCut for thin glyphs.
+    # local background. The general estimate is "far from the border colour",
+    # which isolates a graphic on a roughly uniform field. But solid white/black
+    # lettering laid over a *photo* defeats that: the border colour is meaningless
+    # and the distance test also lights up the bright/dark patches of the busy
+    # background. So we score several ink hypotheses — distance-from-border plus
+    # near-white / near-black low-saturation lettering — and keep the one that
+    # behaves like ink: a genuine minority that sits *interior* to the crop. The
+    # discriminator is border-ring coverage: the background bleeds to the edges,
+    # the ink doesn't, so the lowest-border-coverage minority is the graphic
+    # (size alone can't tell ink from a same-size patch of backdrop). Works far
+    # better than GrabCut for thin glyphs.
     try:
         import numpy as np
     except Exception:
@@ -685,10 +719,45 @@ def _flat_foreground_mask(crop):
         border = np.concatenate([arr[0, :, :], arr[-1, :, :], arr[:, 0, :], arr[:, -1, :]], axis=0)
         bg = np.median(border, axis=0)
         dist = np.sqrt(((arr - bg) ** 2).sum(axis=2))
-        m = (dist > 36.0).astype("uint8")
-        frac = float(m.mean())
-        if frac < 0.004 or frac > 0.97:
-            return None  # nothing distinct, or element fills the box -> no clip
+        lum = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+        sat = arr.max(axis=2) - arr.min(axis=2)
+
+        def border_cov(mm):
+            ring = np.concatenate([mm[0, :], mm[-1, :], mm[:, 0], mm[:, -1]])
+            return float(ring.mean())
+
+        m_border = (dist > 36.0).astype("uint8")
+        candidates = [
+            ("border", m_border),
+            ("lum", ((lum > 180) & (sat < 50)).astype("uint8")),  # near-white lettering
+            ("lum", ((lum < 70) & (sat < 50)).astype("uint8")),   # near-black lettering
+        ]
+        best = None
+        for kind, cm in candidates:
+            f = float(cm.mean())
+            if not (0.004 < f < 0.6):   # not a genuine minority foreground
+                continue
+            key = (border_cov(cm), f)   # lowest border coverage = most ink-like
+            if best is None or key < best[0]:
+                best = (key, kind, cm)
+        if best is not None:
+            kind, m = best[1], best[2]
+            if kind == "lum":
+                # A luminance-extreme hypothesis is single-shade ink by
+                # construction (pure white or pure black), so any blob whose
+                # brightness is well off that shade is a stray photo patch that
+                # happened to clear the threshold (e.g. a bright window reflection
+                # behind the lettering). Drop those components so the clip hugs the
+                # ink only.
+                m = _drop_offshade_blobs(m, lum)
+        else:
+            f = float(m_border.mean())
+            if f < 0.004 or f > 0.97:
+                return None  # nothing distinct, or the element fills the box
+            # No clean minority. Keep the border mask (frac in [0.6, 0.97]); the
+            # caller treats a non-minority mask as untrustworthy and decides
+            # between an unclipped trace and the raster base.
+            m = m_border
         try:
             import cv2
             k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -701,6 +770,36 @@ def _flat_foreground_mask(crop):
         return m
     except Exception:
         return None
+
+
+def _bg_is_flat(crop, fg_mask, threshold=11.0):
+    """Is the area *behind* the detected ink flat (a solid/graphic field) rather
+    than photographic? Neutralise the foreground (so the ink doesn't dominate the
+    palette), then reuse the _is_flat reconstruction-error test on what's left.
+    Used when the foreground couldn't be cleanly isolated, to decide whether an
+    unclipped vector trace is safe (flat backdrop) or would smear a photo into
+    garbage paths (so the region should stay raster)."""
+    try:
+        import numpy as np
+        from PIL import Image, ImageChops
+    except Exception:
+        return True
+    try:
+        arr = np.array(crop.convert("RGB"))
+        bgpx = arr[fg_mask == 0]
+        if bgpx.size == 0:
+            return True
+        med = np.median(bgpx.reshape(-1, 3), axis=0).astype("uint8")
+        filled = arr.copy()
+        filled[fg_mask > 0] = med
+        small = Image.fromarray(filled).resize((96, 96))
+        approx = small.quantize(colors=16).convert("RGB")
+        diff = ImageChops.difference(small, approx).convert("L")
+        hist = diff.histogram()
+        mean = sum(i * c for i, c in enumerate(hist)) / (96 * 96)
+        return mean < threshold
+    except Exception:
+        return True
 
 
 def _region_mask(crop, backend="auto"):
@@ -817,18 +916,35 @@ def vectorize_image(img_bytes, elements, options):
                 clip_defs, g_open, g_close = "", "", ""
                 masked_ok = True
                 is_flat_crop = _is_flat(crop, flat_threshold)
-                # A flat crop is all graphic: stripping the background base already
-                # isolates the glyphs/logo, so DON'T clip it — a polygon clip only
-                # risks shaving letter edges (ascenders, thin strokes). Masking is
-                # only needed on a non-flat crop, to cut away the photographic parts.
-                if use_mask and not is_flat_crop:
-                    m = _region_mask(crop, backend)
+                # Both flat and non-flat crops get clipped so the background behind
+                # the graphic isn't painted as an opaque vector box — _strip_bg_paths
+                # only removes ~full-coverage fills, so partial-coverage background
+                # patches survive and need a clip to cut them away. The mask source
+                # differs: a non-flat crop (text/logo over a photo) uses SAM to
+                # separate graphic from photo; a flat crop uses the ink-isolation
+                # heuristic, which is built for thin glyphs and dilated outward so it
+                # never shaves letter edges (ascenders, thin strokes).
+                if use_mask:
+                    m = _flat_foreground_mask(crop) if is_flat_crop else _region_mask(crop, backend)
                     frac = float(m.mean()) if m is not None else 1.0
                     polys = _mask_to_polys(m) if m is not None else []
                     # Trust the mask only when it isolates a minority foreground (the
                     # ink/logo); a mask covering most of the box hasn't separated the
                     # graphic from the photo.
                     good = bool(polys) and frac < 0.6
+                    if not good and is_flat_crop:
+                        # The cheap ink heuristic couldn't isolate the lettering —
+                        # typically a graphic laid over a photo, where SAM (if
+                        # configured) separates ink from the busy backdrop far better
+                        # than the border/luminance heuristics. A flat crop normally
+                        # skips SAM (the heuristic is gentler on thin glyphs), so we
+                        # only escalate here, when the heuristic has already failed.
+                        m2 = _sam_mask(crop)
+                        if m2 is not None:
+                            f2 = float(m2.mean())
+                            p2 = _mask_to_polys(m2)
+                            if p2 and f2 < 0.6:
+                                m, frac, polys, good = m2, f2, p2, True
                     if good:
                         cid = "vclip%d" % idx
                         clip_defs = '<defs><clipPath id="%s">%s</clipPath></defs>' % (
@@ -836,12 +952,24 @@ def vectorize_image(img_bytes, elements, options):
                         g_open, g_close = '<g clip-path="url(#%s)">' % cid, "</g>"
                         region["masked"] = True
                         stats["masked"] += 1
-                    else:
+                    elif m is None:
+                        # No distinct foreground at all: either a uniform field or a
+                        # graphic that fills the box. Fine to overlay the stripped
+                        # trace unclipped on a flat crop; on a non-flat (photographic)
+                        # crop keep the raster base instead.
+                        if not is_flat_crop:
+                            masked_ok = False
+                    elif not _bg_is_flat(crop, m, flat_threshold):
+                        # A foreground was found but it isn't a clean minority, and
+                        # the area behind it is photographic — tracing it unclipped
+                        # would smear the photo into vector paths (the classic
+                        # "white text over a photo leaks the whole background" case).
+                        # Keep this region as the raster base.
                         masked_ok = False
-                if use_mask and not masked_ok and mode != "on" and not is_flat_crop:
-                    # Couldn't isolate the graphic and the crop isn't a flat graphic
-                    # (it has photographic detail): keep this region as the raster base
-                    # rather than tracing the photo into a box of garbage paths.
+                if use_mask and not masked_ok and mode != "on":
+                    # Couldn't isolate the graphic from a photographic backdrop: keep
+                    # this region as the raster base rather than tracing the photo
+                    # into a box of garbage paths.
                     region["raster_fallback"] = True
                     stats["raster"] += 1
                 else:
