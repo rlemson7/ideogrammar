@@ -725,6 +725,27 @@ def _mask_to_polys(m):
     return polys
 
 
+def _strip_bg_paths(inner, cw, ch, thresh=0.92):
+    """Drop VTracer paths whose bounding box spans ~the whole crop — its
+    full-canvas background base layer and any full-width "frame" layers. The
+    raster base already holds that background, so keeping these as opaque vector
+    fills would just paint a box over the photo. What's left is the crisp
+    foreground detail (glyphs, logo shapes), transparent everywhere else."""
+    area = max(1.0, float(cw) * float(ch))
+    out = []
+    for tag in re.finditer(r'<path\b[^>]*?/>', inner):
+        s = tag.group(0)
+        dm = re.search(r'\bd="([^"]+)"', s)
+        if dm:
+            nums = re.findall(r'-?\d+(?:\.\d+)?', dm.group(1))
+            xs = [float(n) for n in nums[0::2]]
+            ys = [float(n) for n in nums[1::2]]
+            if xs and ys and ((max(xs) - min(xs)) * (max(ys) - min(ys)) / area) >= thresh:
+                continue
+        out.append(s)
+    return "".join(out)
+
+
 def vectorize_image(img_bytes, elements, options):
     """Build a hybrid SVG: full render as a raster base, flat regions traced to
     vector and overlaid in place. Routing: text/logo always vector, subject/bg
@@ -773,22 +794,46 @@ def vectorize_image(img_bytes, elements, options):
         if do_vec:
             try:
                 inner, cw, ch = _trace_crop(crop)
+                # VTracer's bottom layer is a full-canvas background fill (and busy
+                # regions add full-width "frame" layers). The raster base already
+                # holds that background, so an opaque vector copy of it just paints a
+                # box over the photo. Drop full-coverage paths so the overlay carries
+                # only the crisp foreground detail and is transparent elsewhere.
+                inner = _strip_bg_paths(inner, cw, ch)
                 clip_defs, g_open, g_close = "", "", ""
+                masked_ok = True
+                is_flat_crop = _is_flat(crop, flat_threshold)
                 if use_mask:
                     m = _region_mask(crop, backend)
+                    frac = float(m.mean()) if m is not None else 1.0
                     polys = _mask_to_polys(m) if m is not None else []
-                    if polys:
+                    # Clip only when the mask cleanly isolates a foreground. A flat
+                    # crop is all graphic, so even a large mask is fine; a non-flat
+                    # crop (contains photo) is only trusted when the mask selects a
+                    # minority — the ink/logo — not most of the box. Otherwise the
+                    # mask failed to separate graphic from photo.
+                    good = bool(polys) and (frac < 0.9 if is_flat_crop else frac < 0.6)
+                    if good:
                         cid = "vclip%d" % idx
                         clip_defs = '<defs><clipPath id="%s">%s</clipPath></defs>' % (
                             cid, "".join('<polygon points="%s"/>' % p for p in polys))
                         g_open, g_close = '<g clip-path="url(#%s)">' % cid, "</g>"
                         region["masked"] = True
                         stats["masked"] += 1
-                vec_parts.append(
-                    '<svg x="%d" y="%d" width="%d" height="%d" viewBox="0 0 %d %d" preserveAspectRatio="none">%s%s%s%s</svg>'
-                    % (px1, py1, px2 - px1, py2 - py1, cw, ch, clip_defs, g_open, inner, g_close))
-                region["vector"] = True
-                stats["vectorized"] += 1
+                    else:
+                        masked_ok = False
+                if use_mask and not masked_ok and mode != "on" and not is_flat_crop:
+                    # Couldn't isolate the graphic and the crop isn't a flat graphic
+                    # (it has photographic detail): keep this region as the raster base
+                    # rather than tracing the photo into a box of garbage paths.
+                    region["raster_fallback"] = True
+                    stats["raster"] += 1
+                else:
+                    vec_parts.append(
+                        '<svg x="%d" y="%d" width="%d" height="%d" viewBox="0 0 %d %d" preserveAspectRatio="none">%s%s%s%s</svg>'
+                        % (px1, py1, px2 - px1, py2 - py1, cw, ch, clip_defs, g_open, inner, g_close))
+                    region["vector"] = True
+                    stats["vectorized"] += 1
             except Exception as e:
                 region["error"] = str(e)
                 stats["raster"] += 1
