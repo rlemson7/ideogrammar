@@ -542,7 +542,9 @@ def _is_flat(crop, threshold=11.0):
     small = crop.resize((96, 96))
     approx = small.quantize(colors=16).convert("RGB")
     diff = ImageChops.difference(small, approx).convert("L")
-    mean = sum(diff.getdata()) / (96 * 96)
+    # Mean pixel value via the histogram (avoids the deprecated getdata()).
+    hist = diff.histogram()
+    mean = sum(i * count for i, count in enumerate(hist)) / (96 * 96)
     return mean < threshold
 
 
