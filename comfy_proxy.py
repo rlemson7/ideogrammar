@@ -783,8 +783,18 @@ def vectorize_image(img_bytes, elements, options):
         py2 = max(0, min(H, round(max(y1, y2) / 1000.0 * H)))
         if px2 - px1 < 4 or py2 - py1 < 4:
             continue
+        # Pad the trace crop a little (clamped to the image). Titles often have
+        # glyphs whose tops/edges sit right on the element's bbox boundary; without
+        # margin VTracer shaves them off and the crisp vector ends up shorter than
+        # the raster underneath. The overlay is positioned at the padded box so the
+        # glyphs still land in the right place.
+        pad = max(4, round(min(px2 - px1, py2 - py1) * 0.06))
+        ax1 = max(0, px1 - pad)
+        ay1 = max(0, py1 - pad)
+        ax2 = min(W, px2 + pad)
+        ay2 = min(H, py2 + pad)
         t = (el.get("type") or "").lower()
-        crop = img.crop((px1, py1, px2, py2))
+        crop = img.crop((ax1, ay1, ax2, ay2))
         mode = (el.get("vectorize") or "auto").lower()
         if mode == "off":
             do_vec = False
@@ -835,7 +845,7 @@ def vectorize_image(img_bytes, elements, options):
                 else:
                     vec_parts.append(
                         '<svg x="%d" y="%d" width="%d" height="%d" viewBox="0 0 %d %d" preserveAspectRatio="none">%s%s%s%s</svg>'
-                        % (px1, py1, px2 - px1, py2 - py1, cw, ch, clip_defs, g_open, inner, g_close))
+                        % (ax1, ay1, ax2 - ax1, ay2 - ay1, cw, ch, clip_defs, g_open, inner, g_close))
                     region["vector"] = True
                     stats["vectorized"] += 1
             except Exception as e:
