@@ -278,7 +278,8 @@ class Handler(BaseHTTPRequestHandler):
                     (" route=" + el["route"]) if el.get("route") else "",
                     "ERROR:" + r["error"] if r.get("error")
                     else "retyped" if r.get("retyped")
-                    else ("vector" + (" full" if r.get("full_trace") else " masked" if r.get("masked") else "")) if r.get("vector")
+                    else ("vector" + (" full" if r.get("full_trace") else " masked" if r.get("masked") else "")
+                          + (" tuned" if r.get("tuned") else "")) if r.get("vector")
                     else "raster"))
             sys.stderr.write("[vectorize] %s\n" % " | ".join(summary or ["no regions"]))
             sys.stderr.flush()
@@ -585,26 +586,74 @@ def _rotate_bbox(b, deg):
     return [x1, y1, x2, y2]
 
 
-def _trace_crop(crop):
+def _quantize_to_palette(crop, palette):
+    """Snap every pixel to the nearest color of an LLM-suggested palette before
+    tracing. Flat art rendered by the diffusion model carries noise and
+    anti-aliasing gradients around what should be a handful of exact colors;
+    quantizing first gives VTracer clean fields, so the output carries exactly
+    those fills instead of dozens of near-duplicates. Returns the crop unchanged
+    when the palette is unusable."""
+    try:
+        import numpy as np
+        from PIL import Image
+        cols = []
+        for c in palette or []:
+            m = re.match(r"^#?([0-9a-fA-F]{6})$", str(c).strip())
+            if m:
+                v = int(m.group(1), 16)
+                cols.append(((v >> 16) & 255, (v >> 8) & 255, v & 255))
+        if len(cols) < 2:
+            return crop
+        arr = np.array(crop.convert("RGB")).astype("int32")
+        pal = np.array(cols[:16], dtype="int32")
+        best = None
+        idx = None
+        for k in range(len(pal)):
+            d = ((arr - pal[k]) ** 2).sum(axis=2)
+            if best is None:
+                best, idx = d, np.zeros(d.shape, dtype="uint8")
+            else:
+                closer = d < best
+                best[closer] = d[closer]
+                idx[closer] = k
+        return Image.fromarray(pal[idx].astype("uint8"))
+    except Exception:
+        return crop
+
+
+def _trace_crop(crop, params=None):
     import vtracer
+    p = params or {}
+    if p.get("palette"):
+        crop = _quantize_to_palette(crop, p["palette"])
+    kw = {}
+    for k in ("filter_speckle", "color_precision", "corner_threshold"):
+        if p.get(k) is not None:
+            try:
+                kw[k] = int(p[k])
+            except Exception:
+                pass
     cw, ch = crop.size
     buf = io.BytesIO()
     crop.save(buf, format="PNG")
     data = buf.getvalue()
     try:
-        svg = vtracer.convert_raw_image_to_svg(data, img_format="png", colormode="color")
+        svg = vtracer.convert_raw_image_to_svg(data, img_format="png", colormode="color", **kw)
     except TypeError:
         import tempfile
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
             f.write(data)
             inp = f.name
         outp = inp + ".svg"
-        vtracer.convert_image_to_svg_py(inp, outp)
+        try:
+            vtracer.convert_image_to_svg_py(inp, outp, **kw)
+        except TypeError:
+            vtracer.convert_image_to_svg_py(inp, outp)
         with open(outp) as fh:
             svg = fh.read()
-        for p in (inp, outp):
+        for fp in (inp, outp):
             try:
-                os.unlink(p)
+                os.unlink(fp)
             except OSError:
                 pass
     m = re.search(r"<svg[^>]*>(.*)</svg>", svg, re.S)
@@ -1083,7 +1132,25 @@ def vectorize_image(img_bytes, elements, options):
                 continue
         if do_vec:
             try:
-                inner, cw, ch = _trace_crop(crop)
+                # Vision-LLM trace tuning (frontend "Tune trace" toggle): per-region
+                # VTracer knobs and an optional exact palette to quantize to before
+                # tracing. Values are clamped here too — the payload crossed the wire.
+                trace_params = None
+                tr = el.get("trace") if isinstance(el.get("trace"), dict) else None
+                if tr:
+                    trace_params = {}
+                    if isinstance(tr.get("palette"), list):
+                        trace_params["palette"] = [str(c) for c in tr["palette"][:16]]
+                    for k, lo, hi in (("filter_speckle", 1, 64), ("color_precision", 1, 8),
+                                      ("corner_threshold", 0, 180)):
+                        try:
+                            trace_params[k] = max(lo, min(hi, int(tr.get(k))))
+                        except Exception:
+                            pass
+                    trace_params = trace_params or None
+                if trace_params:
+                    region["tuned"] = True
+                inner, cw, ch = _trace_crop(crop, trace_params)
                 clip_defs, g_open, g_close = "", "", ""
                 masked_ok = True
                 # A background element — or any non-text/logo element spanning

@@ -905,7 +905,9 @@
           <label class="toggle" style="margin-top:12px;"><input type="checkbox" id="vec-retype"> Re-typeset text via vision LLM <span style="color:var(--faint)">(editable text, font is approximate)</span></label>
           <div class="hint">Sends the rendered bitmap (downscaled) to the LLM configured above to read each text element — string, font guess, color — and emits real <b>&lt;text&gt;</b> elements instead of traced outlines: tiny, crisp, editable. You confirm what was read before it's used; anything unreadable falls back to tracing. The font name is a best guess — viewers without that font substitute one.</div>
           <label class="toggle" style="margin-top:12px;"><input type="checkbox" id="vec-route"> Route regions via vision LLM <span style="color:var(--faint)">(vector vs raster by content)</span></label>
-          <div class="hint">Asks the same LLM what each element actually contains — flat graphic (vectorize), photographic (keep raster), or clutter (skip) — replacing the flatness heuristic for elements still on “auto”. An explicit per-element vector on/off always wins. Both toggles share one LLM call.</div>
+          <div class="hint">Asks the same LLM what each element actually contains — flat graphic (vectorize), photographic (keep raster), or clutter (skip) — replacing the flatness heuristic for elements still on “auto”. An explicit per-element vector on/off always wins. All LLM toggles share one call.</div>
+          <label class="toggle" style="margin-top:12px;"><input type="checkbox" id="vec-tune"> Tune trace via vision LLM <span style="color:var(--faint)">(palette &amp; detail per region)</span></label>
+          <div class="hint">The LLM suggests per-region tracer settings — an exact color palette for flat art (pixels are snapped to it before tracing, so fills come out as clean brand colors instead of dozens of near-duplicates), speckle filtering, color depth, and corner sharpness.</div>
         </div>
       </details>
 
@@ -2954,15 +2956,16 @@ function stepImg(d) {
 /* ---- vectorize (raster -> hybrid SVG via the proxy /vectorize endpoint) ---- */
 const VEC_KEY = "ideogram_vec_cfg";
 let vecCfg = loadVecCfg();
-function loadVecCfg() { let c; try { c = JSON.parse(localStorage.getItem(VEC_KEY)); } catch (_) {} return Object.assign({ mask_backend: "auto", flat_threshold: 11, retypeset_text: false, llm_route: false }, c && typeof c === "object" ? c : {}); }
+function loadVecCfg() { let c; try { c = JSON.parse(localStorage.getItem(VEC_KEY)); } catch (_) {} return Object.assign({ mask_backend: "auto", flat_threshold: 11, retypeset_text: false, llm_route: false, llm_tune: false }, c && typeof c === "object" ? c : {}); }
 function saveVecCfg() { localStorage.setItem(VEC_KEY, JSON.stringify(vecCfg)); }
-function applyVecForm() { $("vec-backend").value = vecCfg.mask_backend; $("vec-flat").value = vecCfg.flat_threshold; $("vec-retype").checked = !!vecCfg.retypeset_text; $("vec-route").checked = !!vecCfg.llm_route; }
+function applyVecForm() { $("vec-backend").value = vecCfg.mask_backend; $("vec-flat").value = vecCfg.flat_threshold; $("vec-retype").checked = !!vecCfg.retypeset_text; $("vec-route").checked = !!vecCfg.llm_route; $("vec-tune").checked = !!vecCfg.llm_tune; }
 function readVecForm() {
   vecCfg.mask_backend = $("vec-backend").value;
   let f = parseFloat($("vec-flat").value);
   vecCfg.flat_threshold = (isFinite(f) && f >= 0 && f <= 60) ? f : 11;
   vecCfg.retypeset_text = $("vec-retype").checked;
   vecCfg.llm_route = $("vec-route").checked;
+  vecCfg.llm_tune = $("vec-tune").checked;
   saveVecCfg();
 }
 /* ---- unified Settings modal (LLM + vectorizer + setups) ---- */
@@ -3182,6 +3185,14 @@ const VISION_ROUTE_PROMPT = `
 For EVERY listed region include:
 - "route": "vector" if the region's content is flat graphic ink that traces cleanly (text, logo, flat illustration, solid shapes); "raster" if it is photographic, 3D-shaded, or gradient/texture-rich; "drop" if it is decorative clutter not worth a vector overlay.
 - "reason": one short factual phrase explaining the route.`;
+const VISION_TUNE_PROMPT = `
+For EVERY listed region also include a "trace" object tuning the vector tracer to that region's content:
+- "palette": ONLY when the region is flat graphic art with a clear small palette — the exact artwork/brand colors as ["#RRGGBB", ...] (2-8 entries, dominant first). Omit for photographic or gradient-rich content.
+- "filter_speckle": 1-16 — minimum speck size in px to keep; raise it to remove noise/grain.
+- "color_precision": 1-8 — color depth; 3-4 merges near-duplicate colors of flat art, 6+ preserves subtle shading.
+- "corner_threshold": 0-180 degrees — 30 keeps sharp logo/text corners, 60 default, 90+ smooths organic shapes.
+Example: "trace": {"palette": ["#E0252C", "#FFFFFF", "#1A1A1A"], "color_precision": 4, "filter_speckle": 8}
+Pick values from what the region actually looks like; omit any field you would leave at default.`;
 const VISION_TEXT_PROMPT = `
 For regions of declared type "text" that you can read, ALSO include:
 - "string": the exact characters shown, preserving case; use \\n between visually separate lines.
@@ -3222,9 +3233,9 @@ async function renderBitmapForLLM(entry) {
 // all elements (wantRoute) and/or text recognition for text elements
 // (wantText). Returns {idx: {route?, reason?, string?, font?, ...}} or null
 // when the LLM isn't configured / there is nothing to analyze.
-async function visionAnalyzeRegions(entry, elements, wantText, wantRoute) {
+async function visionAnalyzeRegions(entry, elements, wantText, wantRoute, wantTune) {
   const idxs = elements.map((e, i) =>
-    e.vectorize !== "off" && (wantRoute || (wantText && e.type === "text")) ? i : -1).filter(i => i >= 0);
+    e.vectorize !== "off" && (wantRoute || wantTune || (wantText && e.type === "text")) ? i : -1).filter(i => i >= 0);
   if (!idxs.length) return null;
   const cfg = loadCfg();
   if (!cfg.baseUrl || !cfg.model || (cfg.provider === "openrouter" && !cfg.apiKey)) {
@@ -3232,7 +3243,7 @@ async function visionAnalyzeRegions(entry, elements, wantText, wantRoute) {
     return null;
   }
   const deg = entry.rotation || 0;
-  const key = [entry.filename, entry.subfolder || "", deg, cfg.model, +wantText, +wantRoute,
+  const key = [entry.filename, entry.subfolder || "", deg, cfg.model, +wantText, +wantRoute, +wantTune,
     idxs.map(i => elements[i].type + ":" + elements[i].bbox.join(",")).join(";")].join("|");
   if (visionAnalysisCache.has(key)) return visionAnalysisCache.get(key);
   const lines = idxs.map(i => {
@@ -3246,7 +3257,7 @@ async function visionAnalyzeRegions(entry, elements, wantText, wantRoute) {
   const content = await chatCompletion(cfg, headers, {
     model: cfg.model,
     messages: [
-      { role: "system", content: VISION_BASE_PROMPT + (wantRoute ? VISION_ROUTE_PROMPT : "") + (wantText ? VISION_TEXT_PROMPT : "") },
+      { role: "system", content: VISION_BASE_PROMPT + (wantRoute ? VISION_ROUTE_PROMPT : "") + (wantTune ? VISION_TUNE_PROMPT : "") + (wantText ? VISION_TEXT_PROMPT : "") },
       { role: "user", content: [{ type: "text", text: "Analyze these regions:\n" + lines.join("\n") }, { type: "image_url", image_url: { url: dataUrl } }] }
     ],
     temperature: 0,
@@ -3261,6 +3272,18 @@ async function visionAnalyzeRegions(entry, elements, wantText, wantRoute) {
     const o = {};
     const route = String(r.route || "").toLowerCase();
     if (["vector", "raster", "drop"].includes(route)) { o.route = route; o.reason = r.reason || ""; }
+    if (r.trace && typeof r.trace === "object") {
+      const tr = {};
+      if (Array.isArray(r.trace.palette)) {
+        const pal = r.trace.palette.map(c => String(c).trim()).filter(c => /^#?[0-9a-fA-F]{6}$/.test(c)).map(c => c.startsWith("#") ? c : "#" + c);
+        if (pal.length >= 2) tr.palette = pal.slice(0, 8);
+      }
+      [["filter_speckle", 1, 64], ["color_precision", 1, 8], ["corner_threshold", 0, 180]].forEach(([k, lo, hi]) => {
+        const v = parseInt(r.trace[k], 10);
+        if (isFinite(v)) tr[k] = Math.max(lo, Math.min(hi, v));
+      });
+      if (Object.keys(tr).length) o.trace = tr;
+    }
     if (r.string || r.text) {
       o.string = String(r.string || r.text); o.font = r.font || ""; o.weight = r.weight;
       o.italic = !!r.italic; o.color = r.color || ""; o.align = r.align || "left";
@@ -3310,10 +3333,15 @@ async function vectorizeEntry(idx) {
   // route each region (vector / raster / drop) by what it actually contains.
   // Strictly additive — any failure, missing LLM config, or a declined confirm
   // just traces with the deterministic heuristics as before.
-  if (vecCfg.retypeset_text || vecCfg.llm_route) {
+  if (vecCfg.retypeset_text || vecCfg.llm_route || vecCfg.llm_tune) {
     setVecStatus('<span class="spinner"></span>Analyzing regions…', "");
     try {
-      const recog = await visionAnalyzeRegions(entry, elements, !!vecCfg.retypeset_text, !!vecCfg.llm_route);
+      const recog = await visionAnalyzeRegions(entry, elements, !!vecCfg.retypeset_text, !!vecCfg.llm_route, !!vecCfg.llm_tune);
+      if (recog && vecCfg.llm_tune) {
+        let tuned = 0;
+        Object.entries(recog).forEach(([i, r]) => { if (r.trace && elements[+i]) { elements[+i].trace = r.trace; tuned++; } });
+        if (tuned) toast(`LLM trace tuning on ${tuned} region(s)`);
+      }
       if (recog && vecCfg.llm_route) {
         // Routing only refines elements still on "auto" — an explicit
         // per-element on/off is the user's call and always wins.
