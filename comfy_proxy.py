@@ -267,7 +267,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json_error(502, "Could not fetch the source image from ComfyUI")
             return
         try:
-            svg, stats = vectorize_image(img_bytes, req.get("elements") or [], req.get("options") or {})
+            elements = req.get("elements") or []
+            svg, stats = vectorize_image(img_bytes, elements, req.get("options") or {})
+            # One journald line per call: what arrived (type/mode/route) and
+            # what happened to each region — the UI only shows counts.
+            summary = []
+            for el, r in zip(elements, stats.get("regions") or []):
+                summary.append("%s mode=%s%s -> %s" % (
+                    r.get("type") or "?", (el.get("vectorize") or "auto"),
+                    (" route=" + el["route"]) if el.get("route") else "",
+                    "ERROR:" + r["error"] if r.get("error")
+                    else "retyped" if r.get("retyped")
+                    else ("vector" + (" full" if r.get("full_trace") else " masked" if r.get("masked") else "")) if r.get("vector")
+                    else "raster"))
+            sys.stderr.write("[vectorize] %s\n" % " | ".join(summary or ["no regions"]))
+            sys.stderr.flush()
         except Exception as e:
             self._json_error(500, "Vectorize failed: %s" % e)
             return
@@ -1004,13 +1018,24 @@ def vectorize_image(img_bytes, elements, options):
         t = (el.get("type") or "").lower()
         crop = img.crop((ax1, ay1, ax2, ay2))
         mode = (el.get("vectorize") or "auto").lower()
+        # Vision-LLM routing (frontend "Route regions" toggle): a semantic
+        # judgment of what the region actually contains — flat graphic, photo,
+        # or clutter — trusted over the flatness heuristic, but never over an
+        # explicit per-element on/off ("drop" and "raster" both mean: leave the
+        # region to the raster base).
+        route = (el.get("route") or "").lower()
+        routed = mode == "auto" and route in ("vector", "raster", "drop")
         if mode == "off":
             do_vec = False
         elif mode == "on":
             do_vec = True
+        elif routed:
+            do_vec = route == "vector"
         else:
             do_vec = (t in flat_types) or (t not in never_types and _is_flat(crop, flat_threshold))
         region = {"type": t, "x": px1, "y": py1, "w": px2 - px1, "h": py2 - py1, "vector": False}
+        if routed:
+            region["route"] = route
         # Re-typeset: a text element with a high-confidence vision recognition
         # becomes a real <text> element — tiny, crisp and editable — instead of
         # traced glyph outlines. The confidence gate is re-checked here (the
@@ -1059,14 +1084,26 @@ def vectorize_image(img_bytes, elements, options):
         if do_vec:
             try:
                 inner, cw, ch = _trace_crop(crop)
-                # VTracer's bottom layer is a full-canvas background fill (and busy
-                # regions add full-width "frame" layers). The raster base already
-                # holds that background, so an opaque vector copy of it just paints a
-                # box over the photo. Drop full-coverage paths so the overlay carries
-                # only the crisp foreground detail and is transparent elsewhere.
-                inner = _strip_bg_paths(inner, cw, ch)
                 clip_defs, g_open, g_close = "", "", ""
                 masked_ok = True
+                # A background element — or any non-text/logo element spanning
+                # ~the whole canvas — IS its own backdrop: there is no underlying
+                # photo to protect, so stripping full-coverage paths or clipping
+                # to a "foreground" would discard most of the content (the bg
+                # washes are exactly the ≥92%-coverage paths, and the ink mask
+                # would clip the whole background down to whatever stands out).
+                # Keep the complete trace, unstripped and unclipped.
+                full_trace = t == "bg" or (
+                    t not in flat_types and (px2 - px1) * (py2 - py1) >= 0.9 * W * H)
+                if full_trace:
+                    region["full_trace"] = True
+                if not full_trace:
+                    # VTracer's bottom layer is a full-canvas background fill (and busy
+                    # regions add full-width "frame" layers). The raster base already
+                    # holds that background, so an opaque vector copy of it just paints a
+                    # box over the photo. Drop full-coverage paths so the overlay carries
+                    # only the crisp foreground detail and is transparent elsewhere.
+                    inner = _strip_bg_paths(inner, cw, ch)
                 is_flat_crop = _is_flat(crop, flat_threshold)
                 # Both flat and non-flat crops get clipped so the background behind
                 # the graphic isn't painted as an opaque vector box — _strip_bg_paths
@@ -1076,7 +1113,7 @@ def vectorize_image(img_bytes, elements, options):
                 # separate graphic from photo; a flat crop uses the ink-isolation
                 # heuristic, which is built for thin glyphs and dilated outward so it
                 # never shaves letter edges (ascenders, thin strokes).
-                if use_mask:
+                if use_mask and not full_trace:
                     m = _flat_foreground_mask(crop) if is_flat_crop else _region_mask(crop, backend)
                     frac = float(m.mean()) if m is not None else 1.0
                     polys = _mask_to_polys(m) if m is not None else []

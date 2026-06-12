@@ -904,6 +904,8 @@
           <input type="number" id="vec-flat" min="0" max="60" step="1">
           <label class="toggle" style="margin-top:12px;"><input type="checkbox" id="vec-retype"> Re-typeset text via vision LLM <span style="color:var(--faint)">(editable text, font is approximate)</span></label>
           <div class="hint">Sends the rendered bitmap (downscaled) to the LLM configured above to read each text element — string, font guess, color — and emits real <b>&lt;text&gt;</b> elements instead of traced outlines: tiny, crisp, editable. You confirm what was read before it's used; anything unreadable falls back to tracing. The font name is a best guess — viewers without that font substitute one.</div>
+          <label class="toggle" style="margin-top:12px;"><input type="checkbox" id="vec-route"> Route regions via vision LLM <span style="color:var(--faint)">(vector vs raster by content)</span></label>
+          <div class="hint">Asks the same LLM what each element actually contains — flat graphic (vectorize), photographic (keep raster), or clutter (skip) — replacing the flatness heuristic for elements still on “auto”. An explicit per-element vector on/off always wins. Both toggles share one LLM call.</div>
         </div>
       </details>
 
@@ -2620,7 +2622,7 @@ async function showResult(base, promptId) {
   let img = null;
   for (const nodeId of Object.keys(outputs)) { const o = outputs[nodeId]; if (o.images && o.images.length) { img = o.images[o.images.length - 1]; break; } }
   if (!img) throw new Error("Render finished but produced no image.");
-  const entry = { filename: img.filename, subfolder: img.subfolder || "", type: img.type || "output", seed: comfyCfg.seed, aspect: comfyCfg.aspect_ratio, ts: Date.now(), time: new Date().toLocaleTimeString(), rotation: 0, setup: lastRenderSetup, elements: state.elements.map(e => ({ type: e.type, bbox: e.bbox.slice() })), _before: sourceImageDataUrl || null, _beforeRef: sourceImageRef || null };
+  const entry = { filename: img.filename, subfolder: img.subfolder || "", type: img.type || "output", seed: comfyCfg.seed, aspect: comfyCfg.aspect_ratio, ts: Date.now(), time: new Date().toLocaleTimeString(), rotation: 0, setup: lastRenderSetup, elements: state.elements.map(e => ({ type: e.type, bbox: e.bbox.slice(), vectorize: e.vectorize || "auto" })), _before: sourceImageDataUrl || null, _beforeRef: sourceImageRef || null };
   // Remember the produced image so a saved setup can show it again later.
   lastRenderImage = { filename: entry.filename, subfolder: entry.subfolder, type: entry.type, rotation: 0, aspect: entry.aspect };
   if (entry.setup) entry.setup.render = lastRenderImage;
@@ -2952,14 +2954,15 @@ function stepImg(d) {
 /* ---- vectorize (raster -> hybrid SVG via the proxy /vectorize endpoint) ---- */
 const VEC_KEY = "ideogram_vec_cfg";
 let vecCfg = loadVecCfg();
-function loadVecCfg() { let c; try { c = JSON.parse(localStorage.getItem(VEC_KEY)); } catch (_) {} return Object.assign({ mask_backend: "auto", flat_threshold: 11, retypeset_text: false }, c && typeof c === "object" ? c : {}); }
+function loadVecCfg() { let c; try { c = JSON.parse(localStorage.getItem(VEC_KEY)); } catch (_) {} return Object.assign({ mask_backend: "auto", flat_threshold: 11, retypeset_text: false, llm_route: false }, c && typeof c === "object" ? c : {}); }
 function saveVecCfg() { localStorage.setItem(VEC_KEY, JSON.stringify(vecCfg)); }
-function applyVecForm() { $("vec-backend").value = vecCfg.mask_backend; $("vec-flat").value = vecCfg.flat_threshold; $("vec-retype").checked = !!vecCfg.retypeset_text; }
+function applyVecForm() { $("vec-backend").value = vecCfg.mask_backend; $("vec-flat").value = vecCfg.flat_threshold; $("vec-retype").checked = !!vecCfg.retypeset_text; $("vec-route").checked = !!vecCfg.llm_route; }
 function readVecForm() {
   vecCfg.mask_backend = $("vec-backend").value;
   let f = parseFloat($("vec-flat").value);
   vecCfg.flat_threshold = (isFinite(f) && f >= 0 && f <= 60) ? f : 11;
   vecCfg.retypeset_text = $("vec-retype").checked;
+  vecCfg.llm_route = $("vec-route").checked;
   saveVecCfg();
 }
 /* ---- unified Settings modal (LLM + vectorizer + setups) ---- */
@@ -3165,24 +3168,30 @@ function deleteSelectedSetup() {
 let lastSvgUrl = null;
 function setVecStatus(html, cls) { const s = $("vectorizeStatus"); s.innerHTML = html; s.className = "status" + (cls ? " " + cls : ""); }
 
-/* ---- vision-LLM text recognition for the vectorizer (re-typesetting) ----
-   The LLM is a director, not an SVG generator: it reads each text region off a
-   downscaled bitmap and returns a small JSON payload (string, font guess, color,
-   confidence) that the proxy turns into real <text> elements instead of traced
-   glyph outlines. Every failure path falls through to plain tracing. */
-const TEXT_RECOG_PROMPT = `You read text regions off a rendered image for vector re-typesetting.
-The user message lists numbered regions, each with its position as percentages of image width/height (x1,y1 = top-left, x2,y2 = bottom-right).
-The listed positions are only rough hints — the text may actually sit elsewhere or be a different size. Search the whole image for each region's text.
-For every region you can read, return the EXACT visible string, your best typographic guess, and WHERE the lettering actually is.
-Reply with ONLY a JSON object keyed by region number:
-{"0": {"string": "Closed", "font": "Poppins", "weight": 800, "italic": false, "color": "#FFFFFF", "align": "left", "bbox": [14.0, 33.2, 86.1, 66.8], "confidence": 0.95}}
+/* ---- vision-LLM region analysis for the vectorizer ----
+   The LLM is a director, not an SVG generator: from a downscaled bitmap it
+   returns a small JSON payload per region — what each region IS (route: flat
+   graphic vs photo vs clutter) and, for text, what it SAYS (string, font guess,
+   color, observed bbox, confidence). The proxy applies those decisions
+   deterministically; every failure path falls through to plain tracing. */
+const VISION_BASE_PROMPT = `You analyze numbered regions of a rendered image to plan its vectorization.
+The user message lists each region's index, declared type, and rough position as percentages of image width/height (x1,y1 = top-left, x2,y2 = bottom-right).
+The listed positions are only rough hints — the actual content may sit elsewhere or be a different size. Look at the whole image.
+Reply with ONLY a JSON object keyed by region number. No prose.`;
+const VISION_ROUTE_PROMPT = `
+For EVERY listed region include:
+- "route": "vector" if the region's content is flat graphic ink that traces cleanly (text, logo, flat illustration, solid shapes); "raster" if it is photographic, 3D-shaded, or gradient/texture-rich; "drop" if it is decorative clutter not worth a vector overlay.
+- "reason": one short factual phrase explaining the route.`;
+const VISION_TEXT_PROMPT = `
+For regions of declared type "text" that you can read, ALSO include:
 - "string": the exact characters shown, preserving case; use \\n between visually separate lines.
 - "font": best-guess font family name (no foundry suffixes); "weight": 100-900; "italic": true/false.
 - "color": dominant fill of the lettering as #RRGGBB; "align": left|center|right within the region.
 - "bbox": [x1, y1, x2, y2] as percentages of image width/height — the tightest box around the lettering AS ACTUALLY RENDERED (not the listed hint).
 - "confidence": 0..1 — how sure you are about the STRING (not the font). Be conservative.
-Omit regions you cannot read. No prose, JSON only.`;
-const textRecogCache = new Map();   // key -> recognition result, so re-vectorizing the same render is free
+Example: {"0": {"route": "vector", "reason": "bold flat headline", "string": "Closed", "font": "Poppins", "weight": 800, "italic": false, "color": "#FFFFFF", "align": "left", "bbox": [14.0, 33.2, 86.1, 66.8], "confidence": 0.95}, "1": {"route": "raster", "reason": "photographic subject"}}
+Omit text fields for regions whose text you cannot read.`;
+const visionAnalysisCache = new Map();   // key -> analysis result, so re-vectorizing the same render is free
 
 // Mirror of the proxy's _rotate_bbox: map a 0..1000 bbox into the frame of the
 // clockwise-rotated image (the bitmap we show the model is the rotated one).
@@ -3209,23 +3218,26 @@ async function renderBitmapForLLM(entry) {
   return c.toDataURL("image/jpeg", 0.85);
 }
 
-// Ask the configured vision LLM to read the text elements off this render.
-// Returns {idx: {string, font, weight, italic, color, align, confidence}} for
-// the readable ones, or null when the LLM isn't configured / nothing to read.
-async function recognizeTextRegions(entry, elements) {
-  const idxs = elements.map((e, i) => e.type === "text" && e.vectorize !== "off" ? i : -1).filter(i => i >= 0);
+// Ask the configured vision LLM to analyze this render's regions: routing for
+// all elements (wantRoute) and/or text recognition for text elements
+// (wantText). Returns {idx: {route?, reason?, string?, font?, ...}} or null
+// when the LLM isn't configured / there is nothing to analyze.
+async function visionAnalyzeRegions(entry, elements, wantText, wantRoute) {
+  const idxs = elements.map((e, i) =>
+    e.vectorize !== "off" && (wantRoute || (wantText && e.type === "text")) ? i : -1).filter(i => i >= 0);
   if (!idxs.length) return null;
   const cfg = loadCfg();
   if (!cfg.baseUrl || !cfg.model || (cfg.provider === "openrouter" && !cfg.apiKey)) {
-    toast("Re-typeset skipped: set a vision LLM in ⚙ Settings.", "bad");
+    toast("LLM region analysis skipped: set a vision LLM in ⚙ Settings.", "bad");
     return null;
   }
   const deg = entry.rotation || 0;
-  const key = [entry.filename, entry.subfolder || "", deg, cfg.model, idxs.map(i => elements[i].bbox.join(",")).join(";")].join("|");
-  if (textRecogCache.has(key)) return textRecogCache.get(key);
+  const key = [entry.filename, entry.subfolder || "", deg, cfg.model, +wantText, +wantRoute,
+    idxs.map(i => elements[i].type + ":" + elements[i].bbox.join(",")).join(";")].join("|");
+  if (visionAnalysisCache.has(key)) return visionAnalysisCache.get(key);
   const lines = idxs.map(i => {
     const b = rotBbox(elements[i].bbox, deg);
-    return `Region ${i}: x1=${(b[0] / 10).toFixed(1)}% y1=${(b[1] / 10).toFixed(1)}% x2=${(b[2] / 10).toFixed(1)}% y2=${(b[3] / 10).toFixed(1)}%`;
+    return `Region ${i} (type "${elements[i].type}"): x1=${(b[0] / 10).toFixed(1)}% y1=${(b[1] / 10).toFixed(1)}% x2=${(b[2] / 10).toFixed(1)}% y2=${(b[3] / 10).toFixed(1)}%`;
   });
   const dataUrl = await renderBitmapForLLM(entry);
   const headers = { "Content-Type": "application/json" };
@@ -3234,27 +3246,34 @@ async function recognizeTextRegions(entry, elements) {
   const content = await chatCompletion(cfg, headers, {
     model: cfg.model,
     messages: [
-      { role: "system", content: TEXT_RECOG_PROMPT },
-      { role: "user", content: [{ type: "text", text: "Read these text regions:\n" + lines.join("\n") }, { type: "image_url", image_url: { url: dataUrl } }] }
+      { role: "system", content: VISION_BASE_PROMPT + (wantRoute ? VISION_ROUTE_PROMPT : "") + (wantText ? VISION_TEXT_PROMPT : "") },
+      { role: "user", content: [{ type: "text", text: "Analyze these regions:\n" + lines.join("\n") }, { type: "image_url", image_url: { url: dataUrl } }] }
     ],
     temperature: 0,
     response_format: { type: "json_object" }
   });
   const parsed = extractJSON(content);
-  if (!parsed || typeof parsed !== "object") throw new Error("The model didn't return usable text recognition JSON.");
+  if (!parsed || typeof parsed !== "object") throw new Error("The model didn't return usable region analysis JSON.");
   const out = {};
   idxs.forEach(i => {
     const r = parsed[String(i)];
-    if (r && typeof r === "object" && (r.string || r.text)) {
-      out[i] = { string: String(r.string || r.text), font: r.font || "", weight: r.weight, italic: !!r.italic, color: r.color || "", align: r.align || "left", confidence: +r.confidence || 0 };
+    if (!r || typeof r !== "object") return;
+    const o = {};
+    const route = String(r.route || "").toLowerCase();
+    if (["vector", "raster", "drop"].includes(route)) { o.route = route; o.reason = r.reason || ""; }
+    if (r.string || r.text) {
+      o.string = String(r.string || r.text); o.font = r.font || ""; o.weight = r.weight;
+      o.italic = !!r.italic; o.color = r.color || ""; o.align = r.align || "left";
+      o.confidence = +r.confidence || 0;
       // Observed bbox (percent of image width/height) -> 0..1000, the proxy's
       // coordinate scale. It's in the displayed/rotated frame the model saw.
       if (Array.isArray(r.bbox) && r.bbox.length === 4 && r.bbox.every(v => isFinite(+v))) {
-        out[i].bbox = r.bbox.map(v => Math.max(0, Math.min(1000, +v * 10)));
+        o.bbox = r.bbox.map(v => Math.max(0, Math.min(1000, +v * 10)));
       }
     }
+    if (Object.keys(o).length) out[i] = o;
   });
-  textRecogCache.set(key, out);
+  visionAnalysisCache.set(key, out);
   return out;
 }
 function vectorizeLast() {
@@ -3273,37 +3292,53 @@ async function vectorizeEntry(idx) {
   if (!base) { setVecStatus("Set a server / run the proxy first.", "err"); return; }
   // Use the layout that produced THIS render (stored on the entry / its setup) so
   // bboxes line up with the actual image — the current canvas may have drifted
-  // since. History entries don't store per-element vectorize modes, so carry
-  // those over from the current elements by position where the type matches.
+  // since. For the vectorize MODE the user's current panel setting wins whenever
+  // the element still lines up (it's what they see and just set); the mode
+  // stored on the entry/setup only fills in when the layout no longer matches.
   const layout = (Array.isArray(entry.elements) && entry.elements.length) ? entry.elements
     : (entry.setup && Array.isArray(entry.setup.elements) && entry.setup.elements.length) ? entry.setup.elements.filter(e => e.enabled !== false)
     : state.elements;
   const elements = layout.map((e, i) => {
     const cur = state.elements[i];
-    const vec = e.vectorize || (cur && cur.type === e.type ? cur.vectorize : "") || "auto";
-    return { type: e.type, bbox: e.bbox.slice(), vectorize: vec || "auto" };
+    const vec = (cur && cur.type === e.type && cur.vectorize) || e.vectorize || "auto";
+    return { type: e.type, bbox: e.bbox.slice(), vectorize: vec };
   });
   const options = { mask_backend: vecCfg.mask_backend, flat_threshold: vecCfg.flat_threshold, rotate: entry.rotation || 0 };
   $("vectorizeBtn").disabled = $("imgVectorize").disabled = true;
-  // Optional vision pass: read the text elements off the bitmap so the proxy can
-  // emit editable <text> instead of traced outlines. Strictly additive — any
-  // failure, missing LLM config, or a declined confirm just traces as before.
-  if (vecCfg.retypeset_text) {
-    setVecStatus('<span class="spinner"></span>Reading text…', "");
+  // Optional vision pass (one call for both features): read the text elements
+  // so the proxy can emit editable <text> instead of traced outlines, and/or
+  // route each region (vector / raster / drop) by what it actually contains.
+  // Strictly additive — any failure, missing LLM config, or a declined confirm
+  // just traces with the deterministic heuristics as before.
+  if (vecCfg.retypeset_text || vecCfg.llm_route) {
+    setVecStatus('<span class="spinner"></span>Analyzing regions…', "");
     try {
-      const recog = await recognizeTextRegions(entry, elements);
-      const hits = recog ? Object.entries(recog).filter(([, r]) => r.confidence >= 0.85 && r.string.trim()) : [];
-      if (hits.length) {
-        const summary = hits.map(([, r]) => `• “${r.string.replace(/\n/g, " ⏎ ")}”  (${r.font || "font?"}${r.weight ? " " + r.weight : ""}, ${Math.round(r.confidence * 100)}%)`).join("\n");
-        if (confirm("Re-typeset as editable text instead of traced outlines?\n\n" + summary + "\n\nCancel keeps the traced outlines.")) {
-          hits.forEach(([i, r]) => { elements[+i].text = r; });
-          options.retypeset_text = true;
+      const recog = await visionAnalyzeRegions(entry, elements, !!vecCfg.retypeset_text, !!vecCfg.llm_route);
+      if (recog && vecCfg.llm_route) {
+        // Routing only refines elements still on "auto" — an explicit
+        // per-element on/off is the user's call and always wins.
+        const counts = { vector: 0, raster: 0, drop: 0 };
+        Object.entries(recog).forEach(([i, r]) => {
+          const el = elements[+i];
+          if (r.route && el && (el.vectorize || "auto") === "auto") { el.route = r.route; counts[r.route]++; }
+        });
+        const n = counts.vector + counts.raster + counts.drop;
+        if (n) toast(`LLM routing: ${counts.vector} vector · ${counts.raster} raster${counts.drop ? ` · ${counts.drop} dropped` : ""}`);
+      }
+      if (recog && vecCfg.retypeset_text) {
+        const hits = Object.entries(recog).filter(([, r]) => r.string && r.string.trim() && r.confidence >= 0.85);
+        if (hits.length) {
+          const summary = hits.map(([, r]) => `• “${r.string.replace(/\n/g, " ⏎ ")}”  (${r.font || "font?"}${r.weight ? " " + r.weight : ""}, ${Math.round(r.confidence * 100)}%)`).join("\n");
+          if (confirm("Re-typeset as editable text instead of traced outlines?\n\n" + summary + "\n\nCancel keeps the traced outlines.")) {
+            hits.forEach(([i, r]) => { elements[+i].text = r; });
+            options.retypeset_text = true;
+          }
+        } else {
+          toast("No text read confidently — tracing as usual.");
         }
-      } else if (recog) {
-        toast("No text read confidently — tracing as usual.");
       }
     } catch (err) {
-      toast("Text recognition failed (" + (err.message || err) + ") — tracing as usual.", "bad");
+      toast("Region analysis failed (" + (err.message || err) + ") — tracing as usual.", "bad");
     }
   }
   setVecStatus('<span class="spinner"></span>Vectorizing…', "");
@@ -3317,6 +3352,13 @@ async function vectorizeEntry(idx) {
     if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
     openSvgViewer(data.svg, data.stats);
     const s = data.stats || {};
+    // Per-region outcome (type, mode, route, vector/raster, errors) — the
+    // status line only shows counts, so log the detail for diagnosis.
+    if (Array.isArray(s.regions)) {
+      console.log("vectorize regions:", s.regions);
+      const errs = s.regions.filter(r => r.error);
+      if (errs.length) toast(`${errs.length} region(s) failed to trace: ${errs[0].error}`, "bad");
+    }
     setVecStatus(`${s.vectorized || 0} vectorized${s.retyped ? ` · ${s.retyped} retyped` : ""} · ${s.masked || 0} masked · ${s.raster || 0} raster ✓`, "ok");
     toast("Vectorized ✓", "ok");
   } catch (err) {
