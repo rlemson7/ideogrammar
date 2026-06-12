@@ -908,6 +908,8 @@
           <div class="hint">Asks the same LLM what each element actually contains — flat graphic (vectorize), photographic (keep raster), or clutter (skip) — replacing the flatness heuristic for elements still on “auto”. An explicit per-element vector on/off always wins. All LLM toggles share one call.</div>
           <label class="toggle" style="margin-top:12px;"><input type="checkbox" id="vec-tune"> Tune trace via vision LLM <span style="color:var(--faint)">(palette &amp; detail per region)</span></label>
           <div class="hint">The LLM suggests per-region tracer settings — an exact color palette for flat art (pixels are snapped to it before tracing, so fills come out as clean brand colors instead of dozens of near-duplicates), speckle filtering, color depth, and corner sharpness.</div>
+          <label class="toggle" style="margin-top:12px;"><input type="checkbox" id="vec-critique"> Self-check result via vision LLM <span style="color:var(--faint)">(one corrective pass)</span></label>
+          <div class="hint">After vectorizing, shows the LLM the original next to the result and applies its corrections — re-route a region, remove an over-tight clip, fall back from re-typeset text to outlines, relax a palette — then vectorizes once more. Adds a second LLM call and a second trace.</div>
         </div>
       </details>
 
@@ -2956,9 +2958,9 @@ function stepImg(d) {
 /* ---- vectorize (raster -> hybrid SVG via the proxy /vectorize endpoint) ---- */
 const VEC_KEY = "ideogram_vec_cfg";
 let vecCfg = loadVecCfg();
-function loadVecCfg() { let c; try { c = JSON.parse(localStorage.getItem(VEC_KEY)); } catch (_) {} return Object.assign({ mask_backend: "auto", flat_threshold: 11, retypeset_text: false, llm_route: false, llm_tune: false }, c && typeof c === "object" ? c : {}); }
+function loadVecCfg() { let c; try { c = JSON.parse(localStorage.getItem(VEC_KEY)); } catch (_) {} return Object.assign({ mask_backend: "auto", flat_threshold: 11, retypeset_text: false, llm_route: false, llm_tune: false, llm_critique: false }, c && typeof c === "object" ? c : {}); }
 function saveVecCfg() { localStorage.setItem(VEC_KEY, JSON.stringify(vecCfg)); }
-function applyVecForm() { $("vec-backend").value = vecCfg.mask_backend; $("vec-flat").value = vecCfg.flat_threshold; $("vec-retype").checked = !!vecCfg.retypeset_text; $("vec-route").checked = !!vecCfg.llm_route; $("vec-tune").checked = !!vecCfg.llm_tune; }
+function applyVecForm() { $("vec-backend").value = vecCfg.mask_backend; $("vec-flat").value = vecCfg.flat_threshold; $("vec-retype").checked = !!vecCfg.retypeset_text; $("vec-route").checked = !!vecCfg.llm_route; $("vec-tune").checked = !!vecCfg.llm_tune; $("vec-critique").checked = !!vecCfg.llm_critique; }
 function readVecForm() {
   vecCfg.mask_backend = $("vec-backend").value;
   let f = parseFloat($("vec-flat").value);
@@ -2966,6 +2968,7 @@ function readVecForm() {
   vecCfg.retypeset_text = $("vec-retype").checked;
   vecCfg.llm_route = $("vec-route").checked;
   vecCfg.llm_tune = $("vec-tune").checked;
+  vecCfg.llm_critique = $("vec-critique").checked;
   saveVecCfg();
 }
 /* ---- unified Settings modal (LLM + vectorizer + setups) ---- */
@@ -3299,6 +3302,106 @@ async function visionAnalyzeRegions(entry, elements, wantText, wantRoute, wantTu
   visionAnalysisCache.set(key, out);
   return out;
 }
+
+/* ---- vision-LLM self-check of the vectorized result (one corrective pass) ----
+   The browser rasterizes the result SVG itself (canvas renders it natively, so
+   no server-side rasterizer is needed); the LLM compares original vs. result
+   and returns corrections in a vocabulary the pipeline can actually apply —
+   re-route, unclip, fall back from re-typeset text to outlines, relax palette
+   or color precision. Exactly one corrective pass; never loops. */
+const VISION_CRITIQUE_PROMPT = `You quality-check a vectorization. The FIRST attached image is the original render; the SECOND is the vectorized result (vector overlays over a raster base).
+The user message lists the numbered regions and how each was handled.
+Compare the two images region by region and find concrete defects: background leaked into a trace as noise, content clipped/shaved away, re-typeset text that reads or sits wrong, colors merged so aggressively that shading or detail vanished, regions that clearly should have been vector or raster.
+Reply with ONLY a JSON object keyed by region number, each value holding ONLY the corrections that region needs (omit regions that look fine):
+- "set": "vector" or "raster" — re-route the region.
+- "unclip": true — keep the trace but remove its clipping (edges or content were shaved off).
+- "trace_outlines": true — the re-typeset text is wrong or misplaced: trace the real glyph outlines instead.
+- "color_precision": 1-8 — raise it when colors were merged too aggressively.
+- "palette": false — remove the forced palette for this region.
+- "why": one short phrase.
+Be conservative: small softness from tracing is normal — flag real defects only. Return {} if the result is faithful. JSON only.`;
+
+// Rasterize an SVG string in the browser (canvas renders the embedded raster
+// base, the traced paths and <text> overlays alike), downscaled for the LLM.
+async function rasterizeSvg(svgText, maxSide) {
+  const url = URL.createObjectURL(new Blob([svgText], { type: "image/svg+xml" }));
+  try {
+    const im = new Image();
+    await new Promise((res, rej) => { im.onload = res; im.onerror = () => rej(new Error("could not rasterize the SVG")); im.src = url; });
+    const scale = Math.min(1, maxSide / Math.max(im.naturalWidth || 1, im.naturalHeight || 1));
+    const c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round((im.naturalWidth || 1) * scale));
+    c.height = Math.max(1, Math.round((im.naturalHeight || 1) * scale));
+    c.getContext("2d").drawImage(im, 0, 0, c.width, c.height);
+    return c.toDataURL("image/jpeg", 0.85);
+  } finally { URL.revokeObjectURL(url); }
+}
+
+// Ask the LLM to compare the original render with the vectorized result and
+// return per-region corrections (keyed by element index). null = not configured.
+async function critiqueResult(entry, data) {
+  const cfg = loadCfg();
+  if (!cfg.baseUrl || !cfg.model || (cfg.provider === "openrouter" && !cfg.apiKey)) return null;
+  const regions = (data.stats && data.stats.regions) || [];
+  if (!regions.length) return null;
+  const lines = regions.map(r => {
+    const how = r.error ? "failed to trace"
+      : r.retyped ? "re-typeset as font text"
+      : r.vector ? "traced to vector" + (r.full_trace ? " (full trace)" : r.masked ? " (clipped to its shape)" : r.unclipped ? " (unclipped)" : "")
+      : "left as raster";
+    return `Region ${r.i} (type "${r.type}", at x=${r.x} y=${r.y} ${r.w}x${r.h}px): ${how}`;
+  });
+  const orig = await renderBitmapForLLM(entry);
+  const result = await rasterizeSvg(data.svg, 768);
+  const headers = { "Content-Type": "application/json" };
+  if (cfg.apiKey) headers["Authorization"] = "Bearer " + cfg.apiKey;
+  if (cfg.provider === "openrouter") { headers["HTTP-Referer"] = location.origin; headers["X-Title"] = "Ideogrammar"; }
+  const content = await chatCompletion(cfg, headers, {
+    model: cfg.model,
+    messages: [
+      { role: "system", content: VISION_CRITIQUE_PROMPT },
+      { role: "user", content: [
+        { type: "text", text: "Regions and how each was handled:\n" + lines.join("\n") },
+        { type: "image_url", image_url: { url: orig } },
+        { type: "image_url", image_url: { url: result } }
+      ] }
+    ],
+    temperature: 0,
+    response_format: { type: "json_object" }
+  });
+  const parsed = extractJSON(content);
+  return parsed && typeof parsed === "object" ? parsed : null;
+}
+
+// Apply critique corrections to the elements payload; returns how many
+// elements changed. Only touches knobs the pipeline understands; the backend
+// still enforces that routing never overrides an explicit user on/off.
+function applyCritique(corr, elements) {
+  let n = 0;
+  Object.entries(corr).forEach(([i, c]) => {
+    const el = elements[+i];
+    if (!el || !c || typeof c !== "object") return;
+    let used = false;
+    if (c.set === "vector" || c.set === "raster") { el.route = c.set; used = true; }
+    if (c.unclip === true) { el.mask = "off"; used = true; }
+    if (c.trace_outlines === true && el.text) { delete el.text; used = true; }
+    if (c.palette === false && el.trace && el.trace.palette) { delete el.trace.palette; used = true; }
+    const cp = parseInt(c.color_precision, 10);
+    if (isFinite(cp)) { el.trace = Object.assign({}, el.trace, { color_precision: Math.max(1, Math.min(8, cp)) }); used = true; }
+    if (used) n++;
+  });
+  return n;
+}
+
+async function postVectorize(base, entry, elements, options) {
+  const res = await fetch(base + "/vectorize", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ src: { filename: entry.filename, subfolder: entry.subfolder, type: entry.type }, elements, options })
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+  return data;
+}
 function vectorizeLast() {
   // Vectorize whatever the inline preview is actually showing — after loading a
   // setup that's the setup's render, not the most recent one in history. Mirrors
@@ -3372,12 +3475,27 @@ async function vectorizeEntry(idx) {
   setVecStatus('<span class="spinner"></span>Vectorizing…', "");
   toast("Vectorizing…");
   try {
-    const res = await fetch(base + "/vectorize", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ src: { filename: entry.filename, subfolder: entry.subfolder, type: entry.type }, elements, options })
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+    let data = await postVectorize(base, entry, elements, options);
+    // Optional self-check (exactly one corrective pass): rasterize the result
+    // in the browser, show the LLM original vs. result, apply its corrections,
+    // and vectorize once more. Any failure keeps the first result.
+    if (vecCfg.llm_critique && data.stats && ((data.stats.vectorized || 0) + (data.stats.retyped || 0)) > 0) {
+      setVecStatus('<span class="spinner"></span>Self-checking result…', "");
+      try {
+        const corr = await critiqueResult(entry, data);
+        const n = corr ? applyCritique(corr, elements) : 0;
+        if (n) {
+          console.log("self-check corrections:", corr);
+          toast(`Self-check: correcting ${n} region(s)…`);
+          setVecStatus('<span class="spinner"></span>Re-vectorizing…', "");
+          data = await postVectorize(base, entry, elements, options);
+        } else if (corr) {
+          toast("Self-check: result is faithful ✓", "ok");
+        }
+      } catch (err) {
+        toast("Self-check failed (" + (err.message || err) + ") — keeping the first result.", "bad");
+      }
+    }
     openSvgViewer(data.svg, data.stats);
     const s = data.stats || {};
     // Per-region outcome (type, mode, route, vector/raster, errors) — the

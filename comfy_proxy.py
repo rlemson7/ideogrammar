@@ -1082,7 +1082,7 @@ def vectorize_image(img_bytes, elements, options):
             do_vec = route == "vector"
         else:
             do_vec = (t in flat_types) or (t not in never_types and _is_flat(crop, flat_threshold))
-        region = {"type": t, "x": px1, "y": py1, "w": px2 - px1, "h": py2 - py1, "vector": False}
+        region = {"i": idx, "type": t, "x": px1, "y": py1, "w": px2 - px1, "h": py2 - py1, "vector": False}
         if routed:
             region["route"] = route
         # Re-typeset: a text element with a high-confidence vision recognition
@@ -1180,7 +1180,13 @@ def vectorize_image(img_bytes, elements, options):
                 # separate graphic from photo; a flat crop uses the ink-isolation
                 # heuristic, which is built for thin glyphs and dilated outward so it
                 # never shaves letter edges (ascenders, thin strokes).
-                if use_mask and not full_trace:
+                # el.mask == "off" is the critique loop's "unclip" correction:
+                # keep the (stripped) trace but skip clipping — used when the
+                # clip shaved content off in the first pass.
+                mask_off = (el.get("mask") or "").lower() == "off"
+                if mask_off:
+                    region["unclipped"] = True
+                if use_mask and not full_trace and not mask_off:
                     m = _flat_foreground_mask(crop) if is_flat_crop else _region_mask(crop, backend)
                     frac = float(m.mean()) if m is not None else 1.0
                     polys = _mask_to_polys(m) if m is not None else []
