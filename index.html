@@ -149,6 +149,8 @@
   .btn-row svg, .hlink svg { width: 17px; height: 17px; display: block; flex-shrink: 0; }
   /* buttons that keep a visible text label next to the icon */
   .btn-row button.has-label { width: auto; padding: 0 13px; gap: 7px; }
+  /* quick-save tints accent while a named setup is loaded (overwrite target) */
+  #quickSaveBtn.active { color: var(--accent); border-color: var(--accent); }
   .hlink {
     background: var(--elevated); color: var(--text);
     border: 1px solid var(--border-strong); border-radius: var(--r-sm);
@@ -341,6 +343,9 @@
   .gallery .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .gallery .thumb:hover { border-color: var(--border-strong); transform: translateY(-1px); }
   .gallery .thumb.active { border-color: var(--accent); box-shadow: var(--ring); }
+  /* saved-setup marker: a small star badge in the thumb corner */
+  .gallery .thumb.saved { border-color: var(--accent-2); }
+  .gallery .thumb .setup-badge { position: absolute; top: 2px; left: 2px; width: 15px; height: 15px; border-radius: 50%; background: var(--accent); color: #fff; font-size: 9px; line-height: 15px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,.5); pointer-events: none; }
 
   /* ---------- image viewer modal ---------- */
   .img-modal { position: relative; display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 10px; max-width: 96vw; }
@@ -428,6 +433,9 @@
       </button>
       <button id="downloadBtn" title="Download JSON" aria-label="Download">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
+      </button>
+      <button id="quickSaveBtn" title="Quick-save setup" aria-label="Quick-save setup">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7"/><path d="M7 3v4a1 1 0 0 0 1 1h7"/></svg>
       </button>
       <button id="settingsBtn" title="Settings" aria-label="Settings">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
@@ -917,13 +925,17 @@
         <summary>Setups &amp; library</summary>
         <div class="cfg-inner">
           <label>Saved setups <span style="color:var(--faint)">(prompt + render parameters)</span></label>
-          <div class="row2" style="grid-template-columns:1fr auto auto auto; align-items:center; gap:6px;">
+          <div class="row2" style="grid-template-columns:1fr auto auto; align-items:center; gap:6px;">
             <select id="setupSel"><option value="">— select —</option></select>
             <button type="button" id="setupLoad">Load</button>
-            <button type="button" id="setupSaveBtn">Save…</button>
             <button type="button" id="setupDel" class="ghost">Delete</button>
           </div>
-          <div class="hint">Save the current prompt + render settings as a reusable setup. Every render in the gallery also stores its full setup — open it in the viewer and press <b>Load setup</b> to bring back exactly what produced it.</div>
+          <div class="row2" style="grid-template-columns:1fr 1fr; align-items:center; gap:6px; margin-top:6px;">
+            <button type="button" id="setupSaveBtn">Save</button>
+            <button type="button" id="setupSaveAsBtn">Save as…</button>
+          </div>
+          <div class="hint" id="setupLoadedHint" style="margin-top:6px;"></div>
+          <div class="hint"><b>Save</b> overwrites the loaded setup; <b>Save as…</b> stores the current settings as a new one. Every render in the gallery also keeps its full setup — open it in the viewer and press <b>Load setup</b> to bring back exactly what produced it.</div>
         </div>
       </details>
 
@@ -2740,12 +2752,13 @@ function renderGallery() {
   pageItems.forEach(i => {
     const it = renderHistory[i];
     const t = document.createElement("div");
-    t.className = "thumb" + (i === viewerIndex ? " active" : "");
-    t.title = "Seed " + it.seed + " · " + it.aspect + (it.time ? " · " + it.time : "");
+    t.className = "thumb" + (i === viewerIndex ? " active" : "") + (it.setupName ? " saved" : "");
+    t.title = (it.setupName ? "Setup: " + it.setupName + " · " : "") + "Seed " + it.seed + " · " + it.aspect + (it.time ? " · " + it.time : "");
     const im = document.createElement("img");
     im.src = viewUrl(it); im.alt = "render " + (i + 1); im.loading = "lazy";
     if (it.rotation) im.style.transform = "rotate(" + it.rotation + "deg)";
     t.appendChild(im);
+    if (it.setupName) { const b = document.createElement("div"); b.className = "setup-badge"; b.textContent = "★"; t.appendChild(b); }
     t.addEventListener("click", () => openImgModal(i));
     g.appendChild(t);
   });
@@ -3022,6 +3035,7 @@ function deleteSelectedLlmPreset() {
 
 /* ---- setups: full prompt + render-param snapshots ---- */
 const SETUPS_KEY = "ideogram_setups";
+let loadedSetupName = null;   // name of the saved setup currently being edited; null = none (Save then acts as Save as)
 function loadSetups() { try { const a = JSON.parse(localStorage.getItem(SETUPS_KEY)); return Array.isArray(a) ? a : []; } catch (_) { return []; } }
 function storeSetups(a) {
   try { localStorage.setItem(SETUPS_KEY, JSON.stringify(a)); }
@@ -3037,6 +3051,19 @@ function storeSetups(a) {
 function refreshSetupList() {
   const sel = $("setupSel"), s = loadSetups();
   sel.innerHTML = '<option value="">— select —</option>' + s.map((x, i) => `<option value="${i}">${escapeHtml(x.name)}</option>`).join("");
+  updateSetupUI();
+}
+// Reflect the loaded setup in the Save button, the indicator line, and the
+// header quick-save button.
+function updateSetupUI() {
+  const loaded = loadedSetupName && loadSetups().some(x => x.name === loadedSetupName);
+  const btn = $("setupSaveBtn"), hint = $("setupLoadedHint"), quick = $("quickSaveBtn");
+  if (btn) btn.title = loaded ? `Overwrite the loaded setup “${loadedSetupName}”` : "No setup loaded yet — saves as a new one";
+  if (hint) hint.innerHTML = loaded ? `Editing setup: <b>${escapeHtml(loadedSetupName)}</b>` : "";
+  if (quick) {
+    quick.title = loaded ? `Quick-save (overwrite “${loadedSetupName}”)` : "Quick-save current settings as a new setup";
+    quick.classList.toggle("active", !!loaded);
+  }
 }
 const SETUP_COMFY_KEYS = ["workflow", "aspect_ratio", "megapixels", "preset", "cfg", "sampler_name", "cfg_override", "start_percent", "end_percent", "batch_size", "diff_model", "uncond_model", "lora_enabled", "lora_name", "lora_strength", "rtxsr_enabled", "rtxsr_quality", "rtxsr_scale", "vae_name", "clip_name", "clip_type", "save"];
 function captureSetup() {
@@ -3115,6 +3142,9 @@ function applySetup(s, beforeImage, beforeRef) {
   applyCanvasAspect();
   render();
   const ref = findRenderForSetup(s);
+  // Treat the setup's render as the current one, so a following quick-save
+  // captures THIS setup's render (not whatever was last rendered).
+  if (ref && ref.filename) lastRenderImage = { filename: ref.filename, subfolder: ref.subfolder || "", type: ref.type || "output", rotation: ref.rotation || 0, aspect: ref.aspect };
   // Make the setup's render openable with its compare slider: attach the
   // reference image to the matching history entry, or add the render to history
   // if it isn't there (e.g. a named setup loaded in a later session).
@@ -3140,9 +3170,12 @@ function applySetup(s, beforeImage, beforeRef) {
   showRenderInPreview(ref);   // records previewRenderRef so clicking the preview opens this render
   toast("Setup loaded ✓", "ok");
 }
-async function saveCurrentSetup() {
-  const name = prompt("Setup name:", (state.high_level_description || "setup").slice(0, 48));
-  if (!name) return;
+// Capture the current settings and store them under `name`, overwriting an
+// existing setup of the same name. Becomes the loaded setup. Returns true on
+// success.
+async function persistSetup(name) {
+  name = (name || "").trim();
+  if (!name) return false;
   const arr = loadSetups();
   const setup = captureSetup();
   // Keep the reference image so the compare slider survives reload — prefer the
@@ -3151,24 +3184,79 @@ async function saveCurrentSetup() {
   const ref = sourceImageRef || (sourceImageDataUrl ? await uploadRefImage(sourceImageDataUrl) : null);
   if (ref) setup.sourceImageRef = ref;
   else if (sourceImageDataUrl) setup.sourceImage = sourceImageDataUrl;
-  const entry = { name: name.trim(), ts: new Date().toLocaleString(), setup };
-  const idx = arr.findIndex(x => x.name === entry.name);
+  const entry = { name, ts: new Date().toLocaleString(), setup };
+  const idx = arr.findIndex(x => x.name === name);
   if (idx >= 0) arr[idx] = entry; else arr.push(entry);
   storeSetups(arr); refreshSetupList();
-  $("setupSel").value = String(arr.findIndex(x => x.name === entry.name));
-  toast("Setup saved ✓", "ok");
+  $("setupSel").value = String(arr.findIndex(x => x.name === name));
+  loadedSetupName = name;
+  updateSetupUI();
+  ensureSetupInGallery(name, setup);
+  return true;
+}
+// Surface a saved setup in the history gallery: tag its render entry with the
+// setup name (the gallery badges it and clicking it loads the named setup), or
+// add the entry if its render isn't in history yet. No-op when the setup has no
+// render to show a thumbnail for.
+function ensureSetupInGallery(name, setup) {
+  const ref = setup && setup.render;
+  if (!ref || !ref.filename) return;
+  const clean = (({ sourceImage, ...rest }) => rest)(setup);   // keep base64 off history entries
+  let idx = historyIndexOf(ref);
+  if (idx < 0 && (ref.type || "output") === "output") {
+    renderHistory.push({
+      filename: ref.filename, subfolder: ref.subfolder || "", type: ref.type || "output",
+      seed: (setup.comfy && setup.comfy.seed != null) ? setup.comfy.seed : "?",
+      aspect: ref.aspect || (setup.comfy && setup.comfy.aspect_ratio) || comfyCfg.aspect_ratio,
+      ts: Date.now(), time: new Date().toLocaleTimeString(), rotation: ref.rotation || 0,
+      setup: clean, setupName: name,
+      _before: sourceImageDataUrl || null, _beforeRef: sourceImageRef || null
+    });
+    idx = renderHistory.length - 1;
+  } else if (idx >= 0) {
+    renderHistory[idx].setupName = name;   // tag the existing render as this saved setup
+    renderHistory[idx].setup = clean;
+  } else {
+    return;   // a non-output render with no history entry — nothing to show
+  }
+  saveRenderHistory();
+  renderGallery();
+}
+// Save: overwrite the loaded setup in place. With nothing loaded yet, fall back
+// to Save as so the button is never a dead end.
+async function saveLoadedSetup() {
+  if (loadedSetupName && loadSetups().some(x => x.name === loadedSetupName)) {
+    if (await persistSetup(loadedSetupName)) toast(`Setup “${loadedSetupName}” updated ✓`, "ok");
+  } else {
+    saveSetupAs();
+  }
+}
+// Save as: store the current settings under a new name (and continue editing it).
+async function saveSetupAs() {
+  const dflt = loadedSetupName ? loadedSetupName + " copy" : (state.high_level_description || "setup").slice(0, 48);
+  const name = prompt("Save as a new setup — name:", dflt);
+  if (!name || !name.trim()) return;
+  if (loadSetups().some(x => x.name === name.trim()) && !confirm(`A setup named “${name.trim()}” already exists. Overwrite it?`)) return;
+  if (await persistSetup(name)) toast(`Setup “${name.trim()}” saved ✓`, "ok");
 }
 function loadSelectedSetup() {
   const i = parseInt($("setupSel").value, 10);
   const arr = loadSetups();
-  if (!isNaN(i) && arr[i]) { applySetup(arr[i].setup); closeSettings(); }
+  if (!isNaN(i) && arr[i]) { applySetup(arr[i].setup); loadedSetupName = arr[i].name; updateSetupUI(); closeSettings(); }
 }
 function deleteSelectedSetup() {
   const i = parseInt($("setupSel").value, 10);
   const arr = loadSetups();
   if (isNaN(i) || !arr[i]) return;
   if (!confirm("Delete setup “" + arr[i].name + "”?")) return;
+  const delName = arr[i].name;
+  if (delName === loadedSetupName) loadedSetupName = null;
+  // Clear the saved-setup tag from any gallery render that carried it (the
+  // render itself stays in history; it just loses the star badge).
+  let touched = false;
+  renderHistory.forEach(e => { if (e.setupName === delName) { delete e.setupName; touched = true; } });
   arr.splice(i, 1); storeSetups(arr); refreshSetupList();
+  if (touched) { saveRenderHistory(); renderGallery(); }
 }
 
 let lastSvgUrl = null;
@@ -3624,11 +3712,18 @@ $("settingsDone").addEventListener("click", closeSettings);
 $("llmPreset").addEventListener("change", e => { const v = e.target.value; if (v !== "") loadLlmPresetByIndex(parseInt(v, 10)); });
 $("llmPresetSave").addEventListener("click", saveCurrentLlmPreset);
 $("llmPresetDel").addEventListener("click", deleteSelectedLlmPreset);
+$("quickSaveBtn").addEventListener("click", saveLoadedSetup);
+updateSetupUI();   // set the quick-save tooltip/state before Settings is ever opened
 $("setupLoad").addEventListener("click", loadSelectedSetup);
-$("setupSaveBtn").addEventListener("click", saveCurrentSetup);
+$("setupSaveBtn").addEventListener("click", saveLoadedSetup);
+$("setupSaveAsBtn").addEventListener("click", saveSetupAs);
 $("setupDel").addEventListener("click", deleteSelectedSetup);
-$("imgLoadSetup").addEventListener("click", () => { const it = renderHistory[viewerIndex]; if (it && it.setup) { applySetup(it.setup, it._before, it._beforeRef); closeImgModal(); } else toast("This render has no saved setup.", "bad"); });
-$("imgRefine").addEventListener("click", () => { const it = renderHistory[viewerIndex]; if (it && it.setup) { applySetup(it.setup, it._before, it._beforeRef); closeImgModal(); openRefineModal(); } else toast("This render has no saved setup.", "bad"); });
+// A gallery render tagged with a saved-setup name re-targets quick-save to that
+// setup; an untagged render's embedded setup loads but isn't a named setup, so
+// Save reverts to Save as.
+function loadedNameFor(it) { return (it && it.setupName && loadSetups().some(x => x.name === it.setupName)) ? it.setupName : null; }
+$("imgLoadSetup").addEventListener("click", () => { const it = renderHistory[viewerIndex]; if (it && it.setup) { applySetup(it.setup, it._before, it._beforeRef); loadedSetupName = loadedNameFor(it); updateSetupUI(); closeImgModal(); } else toast("This render has no saved setup.", "bad"); });
+$("imgRefine").addEventListener("click", () => { const it = renderHistory[viewerIndex]; if (it && it.setup) { applySetup(it.setup, it._before, it._beforeRef); loadedSetupName = loadedNameFor(it); updateSetupUI(); closeImgModal(); openRefineModal(); } else toast("This render has no saved setup.", "bad"); });
 let settingsOverlayPressedSelf = false;
 $("settingsOverlay").addEventListener("mousedown", e => { settingsOverlayPressedSelf = (e.target === $("settingsOverlay")); });
 $("settingsOverlay").addEventListener("click", e => { if (e.target === $("settingsOverlay") && settingsOverlayPressedSelf) closeSettings(); });
