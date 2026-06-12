@@ -849,12 +849,118 @@ def _strip_bg_paths(inner, cw, ch, thresh=0.92):
     return "".join(out)
 
 
+def _snap_text_bbox(img, x1, y1, x2, y2, ink=None):
+    """Snap a rough text bbox to the actual lettering. The diffusion model only
+    loosely honors the layout bbox (and the vision model's reported bbox is
+    coarse), so a replacement <text> placed at the raw box lands at the wrong
+    size/place. Pad the box generously, isolate the ink with the foreground
+    heuristic — keeping only blobs whose median color matches the recognized
+    ink color when one is known, which strips bright photo patches the generic
+    mask picks up — and return the mask's bounding box in image coordinates
+    plus a tight=True flag. Falls back to the input box (tight=False) when no
+    clean ink is found."""
+    W, H = img.size
+    pw = max(8, round((x2 - x1) * 0.25))
+    ph = max(8, round((y2 - y1) * 0.25))
+    cx1, cy1 = max(0, x1 - pw), max(0, y1 - ph)
+    cx2, cy2 = min(W, x2 + pw), min(H, y2 + ph)
+    if cx2 - cx1 < 8 or cy2 - cy1 < 8:
+        return x1, y1, x2, y2, False
+    crop = img.crop((cx1, cy1, cx2, cy2))
+    m = _flat_foreground_mask(crop)
+    if m is None:
+        return x1, y1, x2, y2, False
+    try:
+        import numpy as np
+        if ink is not None:
+            try:
+                import cv2
+                arr = np.array(crop.convert("RGB")).astype("float64")
+                dist = np.sqrt(((arr - np.asarray(ink, dtype="float64")) ** 2).sum(axis=2))
+                n, lab, _, _ = cv2.connectedComponentsWithStats(m, 8)
+                keep = np.zeros_like(m)
+                for i in range(1, n):
+                    comp = lab == i
+                    if float(np.median(dist[comp])) <= 40.0:
+                        keep[comp] = 1
+                if keep.any():
+                    m = keep
+            except Exception:
+                pass
+        ys, xs = np.where(m > 0)
+        if ys.size == 0:
+            return x1, y1, x2, y2, False
+        nx1, nx2 = cx1 + int(xs.min()), cx1 + int(xs.max()) + 1
+        ny1, ny2 = cy1 + int(ys.min()), cy1 + int(ys.max()) + 1
+        if nx2 - nx1 < 4 or ny2 - ny1 < 4:
+            return x1, y1, x2, y2, False
+        return nx1, ny1, nx2, ny2, True
+    except Exception:
+        return x1, y1, x2, y2, False
+
+
+def _retype_text_svg(txt, px1, py1, px2, py2, tight=False):
+    """Build an editable <text> element for a recognized text region, replacing
+    the traced glyph outlines. The string/font/color come from the vision LLM
+    (see the frontend's recognizeTextRegions); geometry is approximate by design:
+    font-size is fitted to the bbox height and a single-line run is stretched to
+    the bbox width with textLength, so the overlay covers the same area as the
+    rendered lettering even when the font guess is off. Returns None when the
+    payload is unusable (caller falls back to tracing)."""
+    from html import escape
+    s = (txt.get("string") or "").strip()
+    if not s:
+        return None
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()] or [s]
+    w, h = px2 - px1, py2 - py1
+    line_h = h / float(len(lines))
+    size = line_h * 0.8
+    baseline_at = 0.8  # fraction of the line box down to the baseline
+    if tight and len(lines) == 1:
+        # The box hugs the ink. Without descenders the ink spans ascender to
+        # baseline (~0.73em) so the em size is larger than the box and the
+        # baseline sits at its bottom; with descenders the ink is ~0.95em and
+        # the baseline sits above the descender space.
+        if any(c in "gjpqyQ" for c in lines[0]):
+            size = h * 1.05
+            baseline_at = 1.0 - 0.22 * 1.05
+        else:
+            size = h * 1.33
+            baseline_at = 1.0
+    fam = (txt.get("font") or "").strip().replace('"', "").replace("'", "")
+    family = "'%s', sans-serif" % fam if fam else "sans-serif"
+    try:
+        weight = int(txt.get("weight"))
+    except Exception:
+        weight = 700
+    style = "italic" if txt.get("italic") else "normal"
+    color = (txt.get("color") or "").strip()
+    if not re.match(r"^#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?$", color):
+        color = "#000000"
+    align = (txt.get("align") or "left").lower()
+    anchor = {"center": "middle", "right": "end"}.get(align, "start")
+    x = px1 + w / 2.0 if anchor == "middle" else (px2 if anchor == "end" else px1)
+    out = []
+    for i, ln in enumerate(lines):
+        attrs = 'x="%g" y="%g"' % (x, py1 + line_h * i + line_h * baseline_at)
+        if len(lines) == 1:
+            attrs += ' textLength="%d" lengthAdjust="spacingAndGlyphs"' % w
+        out.append(
+            '<text %s font-family="%s" font-size="%g" font-weight="%d" '
+            'font-style="%s" fill="%s" text-anchor="%s">%s</text>'
+            % (attrs, escape(family), size, weight, style, color, anchor, escape(ln)))
+    return "".join(out)
+
+
 def vectorize_image(img_bytes, elements, options):
     """Build a hybrid SVG: full render as a raster base, flat regions traced to
     vector and overlaid in place. Routing: text/logo always vector, subject/bg
     always raster, everything else by the flatness heuristic. When masking is
     enabled (and a backend is available), each vector overlay is clipped to the
-    element's actual shape so it doesn't paint a rectangle over the photo."""
+    element's actual shape so it doesn't paint a rectangle over the photo.
+    With options.retypeset_text, a text element carrying a high-confidence
+    recognition payload (el.text, from the frontend's vision pass) is emitted as
+    an editable <text> element instead of traced outlines."""
     from PIL import Image
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     rotate = int(options.get("rotate", 0) or 0) % 360
@@ -867,7 +973,8 @@ def vectorize_image(img_bytes, elements, options):
     flat_types = {"text", "logo"}
     never_types = {"subject", "bg"}
     vec_parts = []
-    stats = {"width": W, "height": H, "vectorized": 0, "raster": 0, "masked": 0, "regions": []}
+    retype = bool(options.get("retypeset_text"))
+    stats = {"width": W, "height": H, "vectorized": 0, "raster": 0, "masked": 0, "retyped": 0, "regions": []}
     for idx, el in enumerate(elements):
         bbox = el.get("bbox") or []
         if len(bbox) != 4:
@@ -904,6 +1011,51 @@ def vectorize_image(img_bytes, elements, options):
         else:
             do_vec = (t in flat_types) or (t not in never_types and _is_flat(crop, flat_threshold))
         region = {"type": t, "x": px1, "y": py1, "w": px2 - px1, "h": py2 - py1, "vector": False}
+        # Re-typeset: a text element with a high-confidence vision recognition
+        # becomes a real <text> element — tiny, crisp and editable — instead of
+        # traced glyph outlines. The confidence gate is re-checked here (the
+        # frontend filters too) so a stale/low-confidence payload still traces.
+        txt = el.get("text") if isinstance(el.get("text"), dict) else None
+        if retype and t == "text" and mode != "off" and txt:
+            try:
+                conf = float(txt.get("confidence") or 0)
+            except Exception:
+                conf = 0.0
+            mark = None
+            if conf >= 0.85:
+                # The render only loosely honors the layout bbox, so place the
+                # replacement <text> where the lettering actually is: start from
+                # the vision model's observed bbox when it gave one (0..1000 in
+                # the displayed/rotated frame — the bitmap it saw — so no
+                # _rotate_bbox here), then snap to the ink for pixel accuracy.
+                tx1, ty1, tx2, ty2 = px1, py1, px2, py2
+                tb = txt.get("bbox")
+                if isinstance(tb, (list, tuple)) and len(tb) == 4:
+                    try:
+                        bb = [float(v) for v in tb]
+                        tx1 = max(0, min(W, round(min(bb[0], bb[2]) / 1000.0 * W)))
+                        tx2 = max(0, min(W, round(max(bb[0], bb[2]) / 1000.0 * W)))
+                        ty1 = max(0, min(H, round(min(bb[1], bb[3]) / 1000.0 * H)))
+                        ty2 = max(0, min(H, round(max(bb[1], bb[3]) / 1000.0 * H)))
+                    except Exception:
+                        tx1, ty1, tx2, ty2 = px1, py1, px2, py2
+                if tx2 - tx1 < 4 or ty2 - ty1 < 4:
+                    tx1, ty1, tx2, ty2 = px1, py1, px2, py2
+                ink = None
+                cm = re.match(r"^#?([0-9a-fA-F]{6})$", (txt.get("color") or "").strip())
+                if cm:
+                    v = int(cm.group(1), 16)
+                    ink = ((v >> 16) & 255, (v >> 8) & 255, v & 255)
+                tx1, ty1, tx2, ty2, tight = _snap_text_bbox(img, tx1, ty1, tx2, ty2, ink)
+                region.update({"x": tx1, "y": ty1, "w": tx2 - tx1, "h": ty2 - ty1})
+                mark = _retype_text_svg(txt, tx1, ty1, tx2, ty2, tight)
+            if mark:
+                vec_parts.append(mark)
+                region["vector"] = True
+                region["retyped"] = True
+                stats["retyped"] += 1
+                stats["regions"].append(region)
+                continue
         if do_vec:
             try:
                 inner, cw, ch = _trace_crop(crop)

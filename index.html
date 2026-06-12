@@ -902,6 +902,8 @@
           <div class="hint">SAM gives pixel-accurate cutouts but is slow on CPU and can grab the wrong region. The heuristic isolates the “ink” from the local background.</div>
           <label style="margin-top:12px;">Flatness threshold <span style="color:var(--faint)">(higher → vectorize more borderline “obj” regions)</span></label>
           <input type="number" id="vec-flat" min="0" max="60" step="1">
+          <label class="toggle" style="margin-top:12px;"><input type="checkbox" id="vec-retype"> Re-typeset text via vision LLM <span style="color:var(--faint)">(editable text, font is approximate)</span></label>
+          <div class="hint">Sends the rendered bitmap (downscaled) to the LLM configured above to read each text element — string, font guess, color — and emits real <b>&lt;text&gt;</b> elements instead of traced outlines: tiny, crisp, editable. You confirm what was read before it's used; anything unreadable falls back to tracing. The font name is a best guess — viewers without that font substitute one.</div>
         </div>
       </details>
 
@@ -2950,13 +2952,14 @@ function stepImg(d) {
 /* ---- vectorize (raster -> hybrid SVG via the proxy /vectorize endpoint) ---- */
 const VEC_KEY = "ideogram_vec_cfg";
 let vecCfg = loadVecCfg();
-function loadVecCfg() { let c; try { c = JSON.parse(localStorage.getItem(VEC_KEY)); } catch (_) {} return Object.assign({ mask_backend: "auto", flat_threshold: 11 }, c && typeof c === "object" ? c : {}); }
+function loadVecCfg() { let c; try { c = JSON.parse(localStorage.getItem(VEC_KEY)); } catch (_) {} return Object.assign({ mask_backend: "auto", flat_threshold: 11, retypeset_text: false }, c && typeof c === "object" ? c : {}); }
 function saveVecCfg() { localStorage.setItem(VEC_KEY, JSON.stringify(vecCfg)); }
-function applyVecForm() { $("vec-backend").value = vecCfg.mask_backend; $("vec-flat").value = vecCfg.flat_threshold; }
+function applyVecForm() { $("vec-backend").value = vecCfg.mask_backend; $("vec-flat").value = vecCfg.flat_threshold; $("vec-retype").checked = !!vecCfg.retypeset_text; }
 function readVecForm() {
   vecCfg.mask_backend = $("vec-backend").value;
   let f = parseFloat($("vec-flat").value);
   vecCfg.flat_threshold = (isFinite(f) && f >= 0 && f <= 60) ? f : 11;
+  vecCfg.retypeset_text = $("vec-retype").checked;
   saveVecCfg();
 }
 /* ---- unified Settings modal (LLM + vectorizer + setups) ---- */
@@ -3161,6 +3164,99 @@ function deleteSelectedSetup() {
 
 let lastSvgUrl = null;
 function setVecStatus(html, cls) { const s = $("vectorizeStatus"); s.innerHTML = html; s.className = "status" + (cls ? " " + cls : ""); }
+
+/* ---- vision-LLM text recognition for the vectorizer (re-typesetting) ----
+   The LLM is a director, not an SVG generator: it reads each text region off a
+   downscaled bitmap and returns a small JSON payload (string, font guess, color,
+   confidence) that the proxy turns into real <text> elements instead of traced
+   glyph outlines. Every failure path falls through to plain tracing. */
+const TEXT_RECOG_PROMPT = `You read text regions off a rendered image for vector re-typesetting.
+The user message lists numbered regions, each with its position as percentages of image width/height (x1,y1 = top-left, x2,y2 = bottom-right).
+The listed positions are only rough hints — the text may actually sit elsewhere or be a different size. Search the whole image for each region's text.
+For every region you can read, return the EXACT visible string, your best typographic guess, and WHERE the lettering actually is.
+Reply with ONLY a JSON object keyed by region number:
+{"0": {"string": "Closed", "font": "Poppins", "weight": 800, "italic": false, "color": "#FFFFFF", "align": "left", "bbox": [14.0, 33.2, 86.1, 66.8], "confidence": 0.95}}
+- "string": the exact characters shown, preserving case; use \\n between visually separate lines.
+- "font": best-guess font family name (no foundry suffixes); "weight": 100-900; "italic": true/false.
+- "color": dominant fill of the lettering as #RRGGBB; "align": left|center|right within the region.
+- "bbox": [x1, y1, x2, y2] as percentages of image width/height — the tightest box around the lettering AS ACTUALLY RENDERED (not the listed hint).
+- "confidence": 0..1 — how sure you are about the STRING (not the font). Be conservative.
+Omit regions you cannot read. No prose, JSON only.`;
+const textRecogCache = new Map();   // key -> recognition result, so re-vectorizing the same render is free
+
+// Mirror of the proxy's _rotate_bbox: map a 0..1000 bbox into the frame of the
+// clockwise-rotated image (the bitmap we show the model is the rotated one).
+function rotBbox(b, deg) {
+  const [x1, y1, x2, y2] = b;
+  if (deg === 90) return [1000 - y2, x1, 1000 - y1, x2];
+  if (deg === 180) return [1000 - x2, 1000 - y2, 1000 - x1, 1000 - y1];
+  if (deg === 270) return [y1, 1000 - x2, y2, 1000 - x1];
+  return [x1, y1, x2, y2];
+}
+
+// Fetch the render, bake its rotation, downscale to ≤768px longest side, and
+// return a JPEG data URL small enough for a cheap vision call.
+async function renderBitmapForLLM(entry) {
+  const url = await bakeRotated(viewUrl(entry), entry.rotation || 0);
+  const im = new Image();
+  im.crossOrigin = "anonymous";
+  await new Promise((res, rej) => { im.onload = res; im.onerror = () => rej(new Error("Could not load the render bitmap.")); im.src = url; });
+  const scale = Math.min(1, 768 / Math.max(im.naturalWidth, im.naturalHeight));
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(im.naturalWidth * scale));
+  c.height = Math.max(1, Math.round(im.naturalHeight * scale));
+  c.getContext("2d").drawImage(im, 0, 0, c.width, c.height);
+  return c.toDataURL("image/jpeg", 0.85);
+}
+
+// Ask the configured vision LLM to read the text elements off this render.
+// Returns {idx: {string, font, weight, italic, color, align, confidence}} for
+// the readable ones, or null when the LLM isn't configured / nothing to read.
+async function recognizeTextRegions(entry, elements) {
+  const idxs = elements.map((e, i) => e.type === "text" && e.vectorize !== "off" ? i : -1).filter(i => i >= 0);
+  if (!idxs.length) return null;
+  const cfg = loadCfg();
+  if (!cfg.baseUrl || !cfg.model || (cfg.provider === "openrouter" && !cfg.apiKey)) {
+    toast("Re-typeset skipped: set a vision LLM in ⚙ Settings.", "bad");
+    return null;
+  }
+  const deg = entry.rotation || 0;
+  const key = [entry.filename, entry.subfolder || "", deg, cfg.model, idxs.map(i => elements[i].bbox.join(",")).join(";")].join("|");
+  if (textRecogCache.has(key)) return textRecogCache.get(key);
+  const lines = idxs.map(i => {
+    const b = rotBbox(elements[i].bbox, deg);
+    return `Region ${i}: x1=${(b[0] / 10).toFixed(1)}% y1=${(b[1] / 10).toFixed(1)}% x2=${(b[2] / 10).toFixed(1)}% y2=${(b[3] / 10).toFixed(1)}%`;
+  });
+  const dataUrl = await renderBitmapForLLM(entry);
+  const headers = { "Content-Type": "application/json" };
+  if (cfg.apiKey) headers["Authorization"] = "Bearer " + cfg.apiKey;
+  if (cfg.provider === "openrouter") { headers["HTTP-Referer"] = location.origin; headers["X-Title"] = "Ideogrammar"; }
+  const content = await chatCompletion(cfg, headers, {
+    model: cfg.model,
+    messages: [
+      { role: "system", content: TEXT_RECOG_PROMPT },
+      { role: "user", content: [{ type: "text", text: "Read these text regions:\n" + lines.join("\n") }, { type: "image_url", image_url: { url: dataUrl } }] }
+    ],
+    temperature: 0,
+    response_format: { type: "json_object" }
+  });
+  const parsed = extractJSON(content);
+  if (!parsed || typeof parsed !== "object") throw new Error("The model didn't return usable text recognition JSON.");
+  const out = {};
+  idxs.forEach(i => {
+    const r = parsed[String(i)];
+    if (r && typeof r === "object" && (r.string || r.text)) {
+      out[i] = { string: String(r.string || r.text), font: r.font || "", weight: r.weight, italic: !!r.italic, color: r.color || "", align: r.align || "left", confidence: +r.confidence || 0 };
+      // Observed bbox (percent of image width/height) -> 0..1000, the proxy's
+      // coordinate scale. It's in the displayed/rotated frame the model saw.
+      if (Array.isArray(r.bbox) && r.bbox.length === 4 && r.bbox.every(v => isFinite(+v))) {
+        out[i].bbox = r.bbox.map(v => Math.max(0, Math.min(1000, +v * 10)));
+      }
+    }
+  });
+  textRecogCache.set(key, out);
+  return out;
+}
 function vectorizeLast() {
   // Vectorize whatever the inline preview is actually showing — after loading a
   // setup that's the setup's render, not the most recent one in history. Mirrors
@@ -3175,21 +3271,53 @@ async function vectorizeEntry(idx) {
   const entry = renderHistory[idx];
   const base = comfyBase();
   if (!base) { setVecStatus("Set a server / run the proxy first.", "err"); return; }
-  // Use the current layout + per-element vectorize modes (matches the latest render).
-  const elements = state.elements.map(e => ({ type: e.type, bbox: e.bbox.slice(), vectorize: e.vectorize || "auto" }));
+  // Use the layout that produced THIS render (stored on the entry / its setup) so
+  // bboxes line up with the actual image — the current canvas may have drifted
+  // since. History entries don't store per-element vectorize modes, so carry
+  // those over from the current elements by position where the type matches.
+  const layout = (Array.isArray(entry.elements) && entry.elements.length) ? entry.elements
+    : (entry.setup && Array.isArray(entry.setup.elements) && entry.setup.elements.length) ? entry.setup.elements.filter(e => e.enabled !== false)
+    : state.elements;
+  const elements = layout.map((e, i) => {
+    const cur = state.elements[i];
+    const vec = e.vectorize || (cur && cur.type === e.type ? cur.vectorize : "") || "auto";
+    return { type: e.type, bbox: e.bbox.slice(), vectorize: vec || "auto" };
+  });
+  const options = { mask_backend: vecCfg.mask_backend, flat_threshold: vecCfg.flat_threshold, rotate: entry.rotation || 0 };
   $("vectorizeBtn").disabled = $("imgVectorize").disabled = true;
+  // Optional vision pass: read the text elements off the bitmap so the proxy can
+  // emit editable <text> instead of traced outlines. Strictly additive — any
+  // failure, missing LLM config, or a declined confirm just traces as before.
+  if (vecCfg.retypeset_text) {
+    setVecStatus('<span class="spinner"></span>Reading text…', "");
+    try {
+      const recog = await recognizeTextRegions(entry, elements);
+      const hits = recog ? Object.entries(recog).filter(([, r]) => r.confidence >= 0.85 && r.string.trim()) : [];
+      if (hits.length) {
+        const summary = hits.map(([, r]) => `• “${r.string.replace(/\n/g, " ⏎ ")}”  (${r.font || "font?"}${r.weight ? " " + r.weight : ""}, ${Math.round(r.confidence * 100)}%)`).join("\n");
+        if (confirm("Re-typeset as editable text instead of traced outlines?\n\n" + summary + "\n\nCancel keeps the traced outlines.")) {
+          hits.forEach(([i, r]) => { elements[+i].text = r; });
+          options.retypeset_text = true;
+        }
+      } else if (recog) {
+        toast("No text read confidently — tracing as usual.");
+      }
+    } catch (err) {
+      toast("Text recognition failed (" + (err.message || err) + ") — tracing as usual.", "bad");
+    }
+  }
   setVecStatus('<span class="spinner"></span>Vectorizing…', "");
   toast("Vectorizing…");
   try {
     const res = await fetch(base + "/vectorize", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ src: { filename: entry.filename, subfolder: entry.subfolder, type: entry.type }, elements, options: { mask_backend: vecCfg.mask_backend, flat_threshold: vecCfg.flat_threshold, rotate: entry.rotation || 0 } })
+      body: JSON.stringify({ src: { filename: entry.filename, subfolder: entry.subfolder, type: entry.type }, elements, options })
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
     openSvgViewer(data.svg, data.stats);
     const s = data.stats || {};
-    setVecStatus(`${s.vectorized || 0} vectorized · ${s.masked || 0} masked · ${s.raster || 0} raster ✓`, "ok");
+    setVecStatus(`${s.vectorized || 0} vectorized${s.retyped ? ` · ${s.retyped} retyped` : ""} · ${s.masked || 0} masked · ${s.raster || 0} raster ✓`, "ok");
     toast("Vectorized ✓", "ok");
   } catch (err) {
     let msg = err.message || String(err);
@@ -3204,7 +3332,7 @@ function openSvgViewer(svgText, stats) {
   lastSvgUrl = URL.createObjectURL(new Blob([svgText], { type: "image/svg+xml" }));
   imgCmpOn = false; $("imgCmp").classList.remove("cmp-on"); $("imgFullBefore").removeAttribute("src");   // no compare over an SVG
   $("imgFull").src = lastSvgUrl;
-  $("imgInfo").textContent = "Vectorized SVG" + (stats ? ` · ${stats.vectorized} vector / ${stats.masked} masked / ${stats.raster} raster · ${stats.width}×${stats.height}` : "");
+  $("imgInfo").textContent = "Vectorized SVG" + (stats ? ` · ${stats.vectorized} vector${stats.retyped ? ` / ${stats.retyped} retyped` : ""} / ${stats.masked} masked / ${stats.raster} raster · ${stats.width}×${stats.height}` : "");
   $("imgDownload").href = lastSvgUrl; $("imgDownload").download = "ideogram-vector.svg";
   $("imgPrev").style.visibility = "hidden"; $("imgNext").style.visibility = "hidden";
   $("imgVectorize").style.display = "none"; // can't vectorize an SVG
