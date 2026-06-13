@@ -204,7 +204,7 @@ function defaultComfyCfg() {
   return {
     mode: "manual",
     url: "http://127.0.0.1:8188",
-    _defaultsV: 2,
+    _defaultsV: 4,
     direct: false, save: false, workflow: "v2",
     aspect_ratio: "1:1 (Square)", megapixels: 2,
     preset: "Turbo", seed: 453251084258580, randomize: true,
@@ -217,14 +217,18 @@ function defaultComfyCfg() {
     vae_name: "flux2-vae.safetensors",
     clip_name: "qwen3vl_8b_fp8_scaled.safetensors", clip_type: "ideogram4",
     batch_size: 1,
-    queue_count: 1, queue_reseed: true, queue_regen: false
+    queue_count: 1, queue_reseed: false, queue_regen: false, queue_guidance: ""
   };
 }
 let comfyCfg = loadComfyCfg();
 function loadComfyCfg() {
   let c; try { c = JSON.parse(localStorage.getItem(COMFY_KEY)); } catch (_) {}
   const cfg = Object.assign(defaultComfyCfg(), c && typeof c === "object" ? c : {});
-  if (cfg._defaultsV !== 2) { cfg.workflow = "v2"; cfg.cfg = 3; cfg.sampler_name = "euler"; cfg._defaultsV = 2; }
+  const v = cfg._defaultsV || 0;
+  if (v < 2) { cfg.workflow = "v2"; cfg.cfg = 3; cfg.sampler_name = "euler"; }
+  if (v < 3) { cfg.queue_reseed = false; }   // queue seed randomization now opt-in
+  if (v < 4) { cfg.queue_regen = false; }    // queue prompt regeneration now opt-in
+  cfg._defaultsV = 4;
   return cfg;
 }
 function saveComfyCfg() { localStorage.setItem(COMFY_KEY, JSON.stringify(comfyCfg)); }

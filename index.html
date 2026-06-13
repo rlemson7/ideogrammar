@@ -693,7 +693,9 @@
             </div>
             <label class="toggle" style="margin-top:10px;"><input type="checkbox" id="cf-queue-reseed"> Randomize seed each iteration</label>
             <label class="toggle" style="margin-top:8px;"><input type="checkbox" id="cf-queue-regen"> Regenerate prompt each iteration <span style="color:var(--faint)">(re-runs the model first)</span></label>
-            <div class="hint">Runs the render the chosen number of times in sequence; each result lands in the History gallery and the Cancel button stops the run. <b>Randomize seed</b> rerolls the noise seed before every render so each one differs. <b>Regenerate prompt</b> also rebuilds the layout from your <b>✨ Generate</b> description (or reference image) before each render — so both the wording and the seed change every time. Needs your model configured in ⚙ Settings.</div>
+            <label style="margin-top:10px;">Guidance <span style="color:var(--faint)">(steers each regenerated prompt)</span></label>
+            <input type="text" id="cf-queue-guidance" placeholder="e.g. make it photorealistic" title="Applied on top of your ✨ Generate description for every regenerated prompt in the queue. Only used when 'Regenerate prompt' is on.">
+            <div class="hint">Runs the render the chosen number of times in sequence; each result lands in the History gallery and the Cancel button stops the run. <b>Randomize seed</b> rerolls the noise seed before every render so each one differs. <b>Regenerate prompt</b> also rebuilds the layout from your <b>✨ Generate</b> description (or reference image) before each render — so both the wording and the seed change every time. <b>Guidance</b> is an extra steering instruction (e.g. <i>make it photorealistic</i>) folded into every regenerated prompt, so the whole queue keeps a consistent direction. Needs your model configured in ⚙ Settings.</div>
           </div>
         </details>
 
@@ -1812,9 +1814,13 @@ let sourceImageRef = null;       // proxy cache key for that image (persists the
 // to the editor. Throws on any failure (missing config, network, unparseable
 // reply). Status/UI messaging is the caller's job, so the render queue can reuse
 // this to rebuild the setup before each iteration.
-async function generateSetup() {
+async function generateSetup(extraGuidance) {
   const cfg = loadCfg();
-  const userPrompt = $("genPrompt").value.trim();
+  // The free-text Generate description, or — for a loaded/manual setup whose
+  // modal field is empty — the setup's own high-level description, so the render
+  // queue can regenerate from the prompt that produced the current setup.
+  const userPrompt = $("genPrompt").value.trim() || (state.high_level_description || "").trim();
+  const guide = (extraGuidance || "").trim();   // steers every regenerated prompt in a queue (e.g. "make it photorealistic")
   if (!userPrompt && !genImageDataUrl) throw new Error("Describe the image, or upload one, in ✨ Generate first.");
   if (!cfg.baseUrl) throw new Error("Set a Base URL in ⚙ Settings.");
   if (!cfg.model) throw new Error("Set a Model name in ⚙ Settings.");
@@ -1827,8 +1833,9 @@ async function generateSetup() {
   let systemContent, userContent;
   if (genImageDataUrl) {
     systemContent = IMAGE_SYSTEM_PROMPT;
-    const text = userPrompt
-      ? "Build the structured layout JSON from the attached image. Extra guidance: " + userPrompt
+    const extra = [userPrompt, guide].filter(Boolean).join(" — ");
+    const text = extra
+      ? "Build the structured layout JSON from the attached image. Extra guidance: " + extra
       : "Build the structured layout JSON from the attached image.";
     userContent = [
       { type: "text", text },
@@ -1836,7 +1843,7 @@ async function generateSetup() {
     ];
   } else {
     systemContent = SYSTEM_PROMPT;
-    userContent = "Description:\n" + userPrompt;
+    userContent = "Description:\n" + userPrompt + (guide ? "\n\nGuidance (apply to the whole composition): " + guide : "");
   }
   systemContent += detailDirective(cfg);   // honor the element-count / description-detail settings
 
@@ -2503,6 +2510,7 @@ function applyComfyForm() {
   $("cf-queue-count").value = comfyCfg.queue_count;
   $("cf-queue-reseed").checked = comfyCfg.queue_reseed;
   $("cf-queue-regen").checked = comfyCfg.queue_regen;
+  $("cf-queue-guidance").value = comfyCfg.queue_guidance || "";
 }
 function readComfyForm() {
   comfyCfg.direct = $("cf-direct").checked;
@@ -2534,6 +2542,7 @@ function readComfyForm() {
   comfyCfg.queue_count = parseInt($("cf-queue-count").value, 10);
   comfyCfg.queue_reseed = $("cf-queue-reseed").checked;
   comfyCfg.queue_regen = $("cf-queue-regen").checked;
+  comfyCfg.queue_guidance = $("cf-queue-guidance").value.trim();
   sanitizeComfyCfg();
   // reflect any corrected numeric values back into the fields
   $("cf-megapixels").value = comfyCfg.megapixels;
@@ -2656,8 +2665,8 @@ async function runRenderQueue() {
   const count = Math.max(1, comfyCfg.queue_count | 0);
   const reseed = comfyCfg.queue_reseed;
   const regen = comfyCfg.queue_regen;
-  if (regen && !$("genPrompt").value.trim() && !genImageDataUrl) {
-    setRenderStatus("Regenerate prompt needs a description or image in ✨ Generate first.", "err"); return;
+  if (regen && !$("genPrompt").value.trim() && !genImageDataUrl && !(state.high_level_description || "").trim()) {
+    setRenderStatus("Regenerate prompt needs a description (✨ Generate or the setup) or a reference image.", "err"); return;
   }
 
   queueActive = true; queueStop = false;
@@ -2668,7 +2677,7 @@ async function runRenderQueue() {
     queueLabel = (i + 1) + "/" + count;    // badge prefix; persists through the per-render status updates
     if (regen) {
       setRenderStatus('<span class="spinner"></span>Regenerating prompt…', "");
-      try { await generateSetup(); }
+      try { await generateSetup(comfyCfg.queue_guidance); }
       catch (err) { setRenderStatus("Prompt regen failed: " + (err.message || err), "err"); break; }
       if (queueStop) break;
     }
@@ -3311,6 +3320,7 @@ function captureSetup() {
     background: state.background,
     elements: state.elements.map(e => ({ type: e.type, bbox: e.bbox.slice(), desc: e.desc, font: e.font || "", color_palette: e.color_palette.slice(), vectorize: e.vectorize || "auto", enabled: e.enabled !== false })),
     comfy,
+    gen_prompt: ($("genPrompt").value || "").trim(),   // the free-text Generate description, so a loaded setup can regenerate its prompt in the render queue
     render: lastRenderImage ? { ...lastRenderImage } : null
   };
 }
@@ -3371,6 +3381,7 @@ function applySetup(s, beforeImage, beforeRef) {
   };
   if (s.comfy) SETUP_COMFY_KEYS.forEach(k => { if (k in s.comfy) comfyCfg[k] = s.comfy[k]; });
   selectedId = null;
+  $("genPrompt").value = s.gen_prompt || "";   // restore the Generate description so the render queue can regenerate this setup's prompt
   sourceImageDataUrl = beforeImage || s.sourceImage || null;   // restore the reference image (compare slider, and so re-renders keep it)
   sourceImageRef = beforeRef || s.sourceImageRef || null;
   saveComfyCfg();
@@ -3992,7 +4003,7 @@ $("renderBtn").addEventListener("click", onRenderClick);
 $("renderBtn2").addEventListener("click", onRenderClick);
 $("renderCancel").addEventListener("click", cancelRender);
 $("cf-rerollSeed").addEventListener("click", () => { comfyCfg.seed = randomSeed(); $("cf-seed").value = comfyCfg.seed; saveComfyCfg(); });
-["cf-url", "cf-save", "cf-aspect", "cf-megapixels", "cf-preset", "cf-seed", "cf-randomize", "cf-cfg", "cf-sampler", "cf-cfgo", "cf-start", "cf-end", "cf-diff", "cf-uncond", "cf-lora-name", "cf-lora-strength", "cf-rtxsr-quality", "cf-rtxsr-scale", "cf-vae", "cf-clip", "cf-cliptype", "cf-batch", "cf-queue-count", "cf-queue-reseed", "cf-queue-regen"].forEach(id => {
+["cf-url", "cf-save", "cf-aspect", "cf-megapixels", "cf-preset", "cf-seed", "cf-randomize", "cf-cfg", "cf-sampler", "cf-cfgo", "cf-start", "cf-end", "cf-diff", "cf-uncond", "cf-lora-name", "cf-lora-strength", "cf-rtxsr-quality", "cf-rtxsr-scale", "cf-vae", "cf-clip", "cf-cliptype", "cf-batch", "cf-queue-count", "cf-queue-reseed", "cf-queue-regen", "cf-queue-guidance"].forEach(id => {
   const e = $(id); if (e) e.addEventListener("change", readComfyForm);
 });
 $("cf-lora-enabled").addEventListener("change", () => { readComfyForm(); syncLoraFields(); });
