@@ -303,6 +303,7 @@
   .status { font-size: 12px; color: var(--muted); flex: 1; line-height: 1.4; }
   .status.err { color: var(--danger); }
   .status.ok { color: var(--success); }
+  .qbadge { display: inline-block; font-size: 11px; font-weight: 600; color: var(--bg); background: var(--accent, #6aa0ff); padding: 1px 7px; border-radius: 999px; margin-right: 4px; vertical-align: baseline; }
   .chip { padding: 5px 10px; font-size: 11px; border: 1px solid var(--border-strong); background: var(--bg); color: var(--muted); border-radius: var(--r); }
   .chip:hover { color: var(--text); border-color: var(--accent); }
   .img-drop { border: 1px dashed var(--border-strong); border-radius: var(--r); padding: 16px; text-align: center; cursor: pointer; transition: border-color .12s, background .12s; }
@@ -680,6 +681,19 @@
             <input type="text" id="cf-clip">
             <label>CLIP type</label>
             <input type="text" id="cf-cliptype">
+          </div>
+        </details>
+
+        <details class="cfg" style="margin-top:12px;" id="cf-queue-details">
+          <summary>Queue multiple renders</summary>
+          <div class="cfg-inner">
+            <div class="row2" style="grid-template-columns:auto 1fr; align-items:center;">
+              <label style="margin:0;">Iterations</label>
+              <input type="number" id="cf-queue-count" min="1" max="100" step="1" title="How many renders to run, one after another. Each result is added to the History gallery.">
+            </div>
+            <label class="toggle" style="margin-top:10px;"><input type="checkbox" id="cf-queue-reseed"> Randomize seed each iteration</label>
+            <label class="toggle" style="margin-top:8px;"><input type="checkbox" id="cf-queue-regen"> Regenerate prompt each iteration <span style="color:var(--faint)">(re-runs the model first)</span></label>
+            <div class="hint">Runs the render the chosen number of times in sequence; each result lands in the History gallery and the Cancel button stops the run. <b>Randomize seed</b> rerolls the noise seed before every render so each one differs. <b>Regenerate prompt</b> also rebuilds the layout from your <b>✨ Generate</b> description (or reference image) before each render — so both the wording and the seed change every time. Needs your model configured in ⚙ Settings.</div>
           </div>
         </details>
 
@@ -1793,18 +1807,18 @@ let genImageDataUrl = null;   // base64 data URL of an uploaded reference image,
 let sourceImageDataUrl = null;   // reference image the current setup was generated from (for the render compare slider); null if text-only / reset
 let sourceImageRef = null;       // proxy cache key for that image (persists the compare slider across reloads); null if not (yet) uploaded
 
-async function runGeneration(alsoRender) {
-  if (generating) return;
+// Core generation: call the configured LLM with the current Generate-modal
+// description (and optional reference image), parse the layout JSON, and apply it
+// to the editor. Throws on any failure (missing config, network, unparseable
+// reply). Status/UI messaging is the caller's job, so the render queue can reuse
+// this to rebuild the setup before each iteration.
+async function generateSetup() {
   const cfg = loadCfg();
   const userPrompt = $("genPrompt").value.trim();
-  if (!userPrompt && !genImageDataUrl) { setGenStatus("Describe the image, or upload one, first.", "err"); return; }
-  if (!cfg.baseUrl) { setGenStatus("Set a Base URL in ⚙ Settings.", "err"); openSettings(); return; }
-  if (!cfg.model) { setGenStatus("Set a Model name in ⚙ Settings.", "err"); openSettings(); return; }
-  if (cfg.provider === "openrouter" && !cfg.apiKey) { setGenStatus("OpenRouter needs an API key (⚙ Settings).", "err"); openSettings(); return; }
-
-  generating = true;
-  $("genRun").disabled = $("genRunRender").disabled = true;
-  setGenStatus('<span class="spinner"></span>' + (genImageDataUrl ? "Reading image…" : "Contacting model…"), "");
+  if (!userPrompt && !genImageDataUrl) throw new Error("Describe the image, or upload one, in ✨ Generate first.");
+  if (!cfg.baseUrl) throw new Error("Set a Base URL in ⚙ Settings.");
+  if (!cfg.model) throw new Error("Set a Model name in ⚙ Settings.");
+  if (cfg.provider === "openrouter" && !cfg.apiKey) throw new Error("OpenRouter needs an API key (⚙ Settings).");
 
   const headers = { "Content-Type": "application/json" };
   if (cfg.apiKey) headers["Authorization"] = "Bearer " + cfg.apiKey;
@@ -1833,14 +1847,28 @@ async function runGeneration(alsoRender) {
     response_format: { type: "json_object" }
   };
 
+  let content;
+  try { content = await chatCompletion(cfg, headers, body); }
+  catch (err) {
+    if (err instanceof TypeError) throw new Error("Network/CORS error reaching " + cfg.baseUrl + ". Check the URL, that the server is running, and that CORS is allowed.");
+    throw err;
+  }
+  const parsed = extractJSON(content);
+  if (!parsed) throw new Error("Could not parse JSON from the model's reply.");
+  loadFromJSON(parsed);
+  sourceImageDataUrl = genImageDataUrl || null;   // remember it so renders can compare against the reference
+  sourceImageRef = null;
+  if (sourceImageDataUrl) uploadRefImage(sourceImageDataUrl).then(k => { sourceImageRef = k; });   // cache on the proxy for persistence
+}
+
+async function runGeneration(alsoRender) {
+  if (generating) return;
+  generating = true;
+  $("genRun").disabled = $("genRunRender").disabled = true;
+  setGenStatus('<span class="spinner"></span>' + (genImageDataUrl ? "Reading image…" : "Contacting model…"), "");
+
   try {
-    const content = await chatCompletion(cfg, headers, body);
-    const parsed = extractJSON(content);
-    if (!parsed) throw new Error("Could not parse JSON from the model's reply.");
-    loadFromJSON(parsed);
-    sourceImageDataUrl = genImageDataUrl || null;   // remember it so renders can compare against the reference
-    sourceImageRef = null;
-    if (sourceImageDataUrl) uploadRefImage(sourceImageDataUrl).then(k => { sourceImageRef = k; });   // cache on the proxy for persistence
+    await generateSetup();
     setGenStatus("Generated ✓", "ok");
     toast("Setup generated ✓", "ok");
     // Generate & render: hand the fresh setup straight to ComfyUI (fire-and-forget
@@ -1850,9 +1878,8 @@ async function runGeneration(alsoRender) {
     else if (alsoRender) { setGenStatus("Generated ✓ — set your ComfyUI server URL to render.", "ok"); setTimeout(closeGenModal, 1400); }
     else setTimeout(closeGenModal, 600);
   } catch (err) {
-    let msg = err.message || String(err);
-    if (err instanceof TypeError) msg = "Network/CORS error reaching " + cfg.baseUrl + ". Check the URL, that the server is running, and that CORS is allowed.";
-    setGenStatus(msg, "err");
+    setGenStatus(err.message || String(err), "err");
+    if (/Base URL|Model name|API key/.test(err.message || "")) openSettings();
   } finally {
     generating = false;
     $("genRun").disabled = $("genRunRender").disabled = false;
@@ -2473,6 +2500,9 @@ function applyComfyForm() {
   $("cf-clip").value = comfyCfg.clip_name;
   $("cf-cliptype").value = comfyCfg.clip_type;
   $("cf-batch").value = comfyCfg.batch_size;
+  $("cf-queue-count").value = comfyCfg.queue_count;
+  $("cf-queue-reseed").checked = comfyCfg.queue_reseed;
+  $("cf-queue-regen").checked = comfyCfg.queue_regen;
 }
 function readComfyForm() {
   comfyCfg.direct = $("cf-direct").checked;
@@ -2501,6 +2531,9 @@ function readComfyForm() {
   comfyCfg.clip_name = $("cf-clip").value.trim();
   comfyCfg.clip_type = $("cf-cliptype").value.trim();
   comfyCfg.batch_size = parseInt($("cf-batch").value, 10);
+  comfyCfg.queue_count = parseInt($("cf-queue-count").value, 10);
+  comfyCfg.queue_reseed = $("cf-queue-reseed").checked;
+  comfyCfg.queue_regen = $("cf-queue-regen").checked;
   sanitizeComfyCfg();
   // reflect any corrected numeric values back into the fields
   $("cf-megapixels").value = comfyCfg.megapixels;
@@ -2509,6 +2542,7 @@ function readComfyForm() {
   $("cf-start").value = comfyCfg.start_percent;
   $("cf-end").value = comfyCfg.end_percent;
   $("cf-batch").value = comfyCfg.batch_size;
+  $("cf-queue-count").value = comfyCfg.queue_count;
   saveComfyCfg();
 }
 
@@ -2520,12 +2554,20 @@ let lastRenderImage = null;   // {filename,subfolder,type,rotation,aspect} of th
 let renderWS = null;
 let renderPromptId = null;   // id of the prompt currently on ComfyUI
 let renderStop = null;       // set by trackRender; halts ws/polling without finishing
-function setRenderStatus(html, cls) { const s = $("renderStatus"); s.innerHTML = html; s.className = "status" + (cls ? " " + cls : ""); }
+let queueActive = false;     // a multi-render queue is running
+let queueStop = false;       // user asked to stop the queue
+let _renderResolve = null;   // resolver for comfyRenderAwait(); only set while the queue drives a render
+let _renderOk = false;       // did the in-flight render complete successfully (vs. fail/cancel)
+let queueLabel = "";   // e.g. "1/2" — shown as a badge while a render queue runs, so the counter survives the per-render status updates
+function setRenderStatus(html, cls) { const s = $("renderStatus"); s.innerHTML = (queueLabel ? '<span class="qbadge" title="Render queue progress">' + queueLabel + '</span> ' : '') + html; s.className = "status" + (cls ? " " + cls : ""); }
 function setBar(frac) { $("renderBar").style.width = Math.max(0, Math.min(1, frac)) * 100 + "%"; }
 function showCancel(on) { const b = $("renderCancel"); if (b) b.style.display = on ? "inline-block" : "none"; }
-function finishRender() { rendering = false; renderStop = null; renderPromptId = null; showCancel(false); $("renderCancel").disabled = false; $("renderBtn").disabled = $("renderBtn2").disabled = false; if (renderWS) { try { renderWS.close(); } catch (_) {} renderWS = null; } }
+// Resolve a pending comfyRenderAwait() promise. No-op for plain single renders.
+function settleRender(ok) { if (_renderResolve) { const r = _renderResolve; _renderResolve = null; r(ok); } }
+function finishRender() { rendering = false; renderStop = null; renderPromptId = null; showCancel(false); $("renderCancel").disabled = false; $("renderBtn").disabled = $("renderBtn2").disabled = queueActive; if (renderWS) { try { renderWS.close(); } catch (_) {} renderWS = null; } settleRender(_renderOk); }
 
 async function cancelRender() {
+  queueStop = true;                      // also halt a running multi-render queue
   if (!rendering) return;
   const base = comfyBase();
   if (renderStop) renderStop();          // stop ws/poll first so no late "Done ✓"
@@ -2543,14 +2585,15 @@ async function cancelRender() {
 }
 
 async function comfyRender() {
-  if (rendering) return;
+  if (rendering) { settleRender(false); return; }
   readComfyForm();
   lastRenderSetup = captureSetup();
   const base = comfyBase();
-  if (!base) { setRenderStatus("Set your ComfyUI server URL first.", "err"); return; }
+  if (!base) { setRenderStatus("Set your ComfyUI server URL first.", "err"); settleRender(false); return; }
   if (comfyCfg.randomize) { comfyCfg.seed = randomSeed(); $("cf-seed").value = comfyCfg.seed; saveComfyCfg(); }
 
   rendering = true;
+  _renderOk = false;
   $("renderBtn").disabled = $("renderBtn2").disabled = true;
   showCancel(true);
   setBar(0);
@@ -2587,6 +2630,61 @@ async function comfyRender() {
   trackRender(base, promptId);
 }
 
+// Run one render and resolve to true on success, false on failure/cancel. Wraps the
+// callback-driven comfyRender/trackRender flow in a promise so the queue can await it.
+function comfyRenderAwait() {
+  return new Promise(resolve => { _renderResolve = resolve; comfyRender(); });
+}
+
+// Entry point for the Render buttons. A plain single render when the queue is set to
+// 1 iteration with no prompt regeneration; otherwise it drives runRenderQueue().
+function onRenderClick() {
+  if (rendering || queueActive) return;
+  readComfyForm();
+  if (comfyCfg.queue_count > 1 || comfyCfg.queue_regen) runRenderQueue();
+  else comfyRender();
+}
+
+// Render the current setup N times in sequence (each result lands in the History
+// gallery). Optionally rerolls the seed and/or regenerates the prompt from the
+// ✨ Generate description before every iteration. Sequential so we never overrun a
+// single ComfyUI GPU; stop via the Cancel button.
+async function runRenderQueue() {
+  if (rendering || queueActive) return;
+  const base = comfyBase();
+  if (!base) { setRenderStatus("Set your ComfyUI server URL first.", "err"); return; }
+  const count = Math.max(1, comfyCfg.queue_count | 0);
+  const reseed = comfyCfg.queue_reseed;
+  const regen = comfyCfg.queue_regen;
+  if (regen && !$("genPrompt").value.trim() && !genImageDataUrl) {
+    setRenderStatus("Regenerate prompt needs a description or image in ✨ Generate first.", "err"); return;
+  }
+
+  queueActive = true; queueStop = false;
+  $("renderBtn").disabled = $("renderBtn2").disabled = true;
+
+  let okCount = 0;
+  for (let i = 0; i < count && !queueStop; i++) {
+    queueLabel = (i + 1) + "/" + count;    // badge prefix; persists through the per-render status updates
+    if (regen) {
+      setRenderStatus('<span class="spinner"></span>Regenerating prompt…', "");
+      try { await generateSetup(); }
+      catch (err) { setRenderStatus("Prompt regen failed: " + (err.message || err), "err"); break; }
+      if (queueStop) break;
+    }
+    if (reseed) { comfyCfg.seed = randomSeed(); $("cf-seed").value = comfyCfg.seed; saveComfyCfg(); }
+    setRenderStatus('<span class="spinner"></span>Rendering…', "");
+    const ok = await comfyRenderAwait();   // resolves when this render finishes
+    if (ok) okCount++;
+    else if (queueStop) break;             // a cancel (not a transient error) stops the run
+  }
+
+  queueLabel = "";
+  queueActive = false;
+  $("renderBtn").disabled = $("renderBtn2").disabled = false;
+  if (!queueStop) { setRenderStatus(`Queue done ✓ · ${okCount}/${count} rendered`, "ok"); toast(`Queue done ✓ (${okCount}/${count})`, "ok"); }
+}
+
 function trackRender(base, promptId) {
   let done = false;
   // Timeout is based on INACTIVITY, not total elapsed time: a long render (e.g.
@@ -2598,7 +2696,7 @@ function trackRender(base, promptId) {
   let lastProgressAt = Date.now();
   const complete = async () => {
     if (done) return; done = true;
-    try { await showResult(base, promptId); }
+    try { await showResult(base, promptId); _renderOk = true; }
     catch (err) { setRenderStatus(err.message || String(err), "err"); }
     finishRender();
   };
@@ -3890,11 +3988,11 @@ document.addEventListener("keydown", e => {
 document.querySelectorAll("#modeSeg button").forEach(btn => {
   btn.addEventListener("click", () => { comfyCfg.mode = btn.dataset.mode; saveComfyCfg(); applyMode(); });
 });
-$("renderBtn").addEventListener("click", comfyRender);
-$("renderBtn2").addEventListener("click", comfyRender);
+$("renderBtn").addEventListener("click", onRenderClick);
+$("renderBtn2").addEventListener("click", onRenderClick);
 $("renderCancel").addEventListener("click", cancelRender);
 $("cf-rerollSeed").addEventListener("click", () => { comfyCfg.seed = randomSeed(); $("cf-seed").value = comfyCfg.seed; saveComfyCfg(); });
-["cf-url", "cf-save", "cf-aspect", "cf-megapixels", "cf-preset", "cf-seed", "cf-randomize", "cf-cfg", "cf-sampler", "cf-cfgo", "cf-start", "cf-end", "cf-diff", "cf-uncond", "cf-lora-name", "cf-lora-strength", "cf-rtxsr-quality", "cf-rtxsr-scale", "cf-vae", "cf-clip", "cf-cliptype", "cf-batch"].forEach(id => {
+["cf-url", "cf-save", "cf-aspect", "cf-megapixels", "cf-preset", "cf-seed", "cf-randomize", "cf-cfg", "cf-sampler", "cf-cfgo", "cf-start", "cf-end", "cf-diff", "cf-uncond", "cf-lora-name", "cf-lora-strength", "cf-rtxsr-quality", "cf-rtxsr-scale", "cf-vae", "cf-clip", "cf-cliptype", "cf-batch", "cf-queue-count", "cf-queue-reseed", "cf-queue-regen"].forEach(id => {
   const e = $(id); if (e) e.addEventListener("change", readComfyForm);
 });
 $("cf-lora-enabled").addEventListener("change", () => { readComfyForm(); syncLoraFields(); });

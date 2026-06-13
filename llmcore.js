@@ -216,7 +216,8 @@ function defaultComfyCfg() {
     rtxsr_enabled: false, rtxsr_quality: "ULTRA", rtxsr_scale: 2,
     vae_name: "flux2-vae.safetensors",
     clip_name: "qwen3vl_8b_fp8_scaled.safetensors", clip_type: "ideogram4",
-    batch_size: 1
+    batch_size: 1,
+    queue_count: 1, queue_reseed: true, queue_regen: false
   };
 }
 let comfyCfg = loadComfyCfg();
@@ -271,6 +272,7 @@ function sanitizeComfyCfg() {
   comfyCfg.batch_size   = Math.round(numInRange(comfyCfg.batch_size, 1, 64, 1));
   comfyCfg.lora_strength = numInRange(comfyCfg.lora_strength, -10, 10, 1);
   comfyCfg.rtxsr_scale   = numInRange(comfyCfg.rtxsr_scale, 1, 4, 2);
+  comfyCfg.queue_count  = Math.round(numInRange(comfyCfg.queue_count, 1, 100, 1));
 }
 
 function getClientId() {
