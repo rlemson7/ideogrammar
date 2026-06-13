@@ -1809,19 +1809,26 @@ let genImageDataUrl = null;   // base64 data URL of an uploaded reference image,
 let sourceImageDataUrl = null;   // reference image the current setup was generated from (for the render compare slider); null if text-only / reset
 let sourceImageRef = null;       // proxy cache key for that image (persists the compare slider across reloads); null if not (yet) uploaded
 
-// Core generation: call the configured LLM with the current Generate-modal
-// description (and optional reference image), parse the layout JSON, and apply it
-// to the editor. Throws on any failure (missing config, network, unparseable
-// reply). Status/UI messaging is the caller's job, so the render queue can reuse
-// this to rebuild the setup before each iteration.
-async function generateSetup(extraGuidance) {
+// The inputs (free-text prompt + optional reference image) that produced the
+// CURRENT setup. Set on every successful generate and on setup load, so the render
+// queue can faithfully regenerate the loaded/generated setup WITHOUT reading the
+// live Generate-modal fields (which belong to the next interactive generation).
+let genContext = { prompt: "", image: null };
+
+// Core generation: call the configured LLM and apply the resulting layout JSON to
+// the editor. Throws on any failure (missing config, network, unparseable reply);
+// status/UI messaging is the caller's job.
+//   opts.context  — {prompt, image} to generate from instead of the live Generate
+//                   fields (used by the render queue to regenerate the loaded setup).
+//   opts.guidance — extra steering folded into the prompt (queue Guidance field).
+// With no opts it reads the Generate-modal description + uploaded image as before.
+async function generateSetup(opts = {}) {
   const cfg = loadCfg();
-  // The free-text Generate description, or — for a loaded/manual setup whose
-  // modal field is empty — the setup's own high-level description, so the render
-  // queue can regenerate from the prompt that produced the current setup.
-  const userPrompt = $("genPrompt").value.trim() || (state.high_level_description || "").trim();
-  const guide = (extraGuidance || "").trim();   // steers every regenerated prompt in a queue (e.g. "make it photorealistic")
-  if (!userPrompt && !genImageDataUrl) throw new Error("Describe the image, or upload one, in ✨ Generate first.");
+  const ctx = opts.context || null;
+  const userPrompt = (ctx ? (ctx.prompt || "") : $("genPrompt").value).trim();
+  const image = ctx ? (ctx.image || null) : genImageDataUrl;
+  const guide = (opts.guidance || "").trim();   // steers every regenerated prompt in a queue (e.g. "make it photorealistic")
+  if (!userPrompt && !image) throw new Error("Describe the image, or upload one, in ✨ Generate first.");
   if (!cfg.baseUrl) throw new Error("Set a Base URL in ⚙ Settings.");
   if (!cfg.model) throw new Error("Set a Model name in ⚙ Settings.");
   if (cfg.provider === "openrouter" && !cfg.apiKey) throw new Error("OpenRouter needs an API key (⚙ Settings).");
@@ -1831,7 +1838,7 @@ async function generateSetup(extraGuidance) {
   if (cfg.provider === "openrouter") { headers["HTTP-Referer"] = location.origin; headers["X-Title"] = "Ideogrammar"; }
 
   let systemContent, userContent;
-  if (genImageDataUrl) {
+  if (image) {
     systemContent = IMAGE_SYSTEM_PROMPT;
     const extra = [userPrompt, guide].filter(Boolean).join(" — ");
     const text = extra
@@ -1839,7 +1846,7 @@ async function generateSetup(extraGuidance) {
       : "Build the structured layout JSON from the attached image.";
     userContent = [
       { type: "text", text },
-      { type: "image_url", image_url: { url: genImageDataUrl } }
+      { type: "image_url", image_url: { url: image } }
     ];
   } else {
     systemContent = SYSTEM_PROMPT;
@@ -1863,9 +1870,19 @@ async function generateSetup(extraGuidance) {
   const parsed = extractJSON(content);
   if (!parsed) throw new Error("Could not parse JSON from the model's reply.");
   loadFromJSON(parsed);
-  sourceImageDataUrl = genImageDataUrl || null;   // remember it so renders can compare against the reference
+  sourceImageDataUrl = image || null;   // remember it so renders can compare against the reference
   sourceImageRef = null;
   if (sourceImageDataUrl) uploadRefImage(sourceImageDataUrl).then(k => { sourceImageRef = k; });   // cache on the proxy for persistence
+  genContext = { prompt: userPrompt, image: image || null };   // record what produced this setup, for queue regeneration
+}
+
+// The inputs to regenerate the CURRENT setup in the render queue: whatever last
+// generated/loaded it, else fall back to the editor's high-level description so a
+// hand-built setup can still be regenerated. Null when there's nothing to go on.
+function currentGenContext() {
+  if (genContext && (genContext.prompt || genContext.image)) return genContext;
+  const hld = (state.high_level_description || "").trim();
+  return hld ? { prompt: hld, image: null } : null;
 }
 
 async function runGeneration(alsoRender) {
@@ -1976,6 +1993,27 @@ function clearGenImage() {
   $("genImageThumb").src = "";
   $("genImagePreview").style.display = "none";
   $("genImageHint").style.display = "block";
+}
+// Set genContext (the inputs the render queue regenerates from) to match a loaded
+// setup, WITHOUT touching the live Generate-modal fields — those belong to the next
+// interactive generation, and leaking a setup's prompt into them contaminates it.
+// Uses the setup's stored prompt (falling back to its high-level description only
+// for text setups), and its reference image: inline if present, else fetched from
+// the proxy cache by key.
+function setGenContextFromSetup(s, beforeImage) {
+  const inline = beforeImage || (s && s.sourceImage) || null;
+  let prompt = (s && s.gen_prompt) || "";
+  if (!prompt && !inline) prompt = (s && s.high_level_description) || "";   // text setup: regen from its description
+  const ctx = { prompt, image: inline };
+  genContext = ctx;
+  if (!inline && s && s.sourceImageRef && comfyBase()) {
+    fetch(refImgUrl(s.sourceImageRef)).then(r => r.ok ? r.blob() : null).then(b => {
+      if (!b) return;
+      const fr = new FileReader();
+      fr.onload = () => { if (genContext === ctx) genContext.image = fr.result; };   // ignore if a newer setup was loaded meanwhile
+      fr.readAsDataURL(b);
+    }).catch(() => {});
+  }
 }
 
 let refining = false;
@@ -2665,8 +2703,9 @@ async function runRenderQueue() {
   const count = Math.max(1, comfyCfg.queue_count | 0);
   const reseed = comfyCfg.queue_reseed;
   const regen = comfyCfg.queue_regen;
-  if (regen && !$("genPrompt").value.trim() && !genImageDataUrl && !(state.high_level_description || "").trim()) {
-    setRenderStatus("Regenerate prompt needs a description (✨ Generate or the setup) or a reference image.", "err"); return;
+  const genCtx = regen ? currentGenContext() : null;   // capture the current setup's inputs up front, so regen doesn't read the live Generate fields
+  if (regen && !genCtx) {
+    setRenderStatus("Regenerate prompt needs a generated/loaded setup, or a description in ✨ Generate.", "err"); return;
   }
 
   queueActive = true; queueStop = false;
@@ -2677,7 +2716,7 @@ async function runRenderQueue() {
     queueLabel = (i + 1) + "/" + count;    // badge prefix; persists through the per-render status updates
     if (regen) {
       setRenderStatus('<span class="spinner"></span>Regenerating prompt…', "");
-      try { await generateSetup(comfyCfg.queue_guidance); }
+      try { await generateSetup({ context: genCtx, guidance: comfyCfg.queue_guidance }); }
       catch (err) { setRenderStatus("Prompt regen failed: " + (err.message || err), "err"); break; }
       if (queueStop) break;
     }
@@ -3381,9 +3420,9 @@ function applySetup(s, beforeImage, beforeRef) {
   };
   if (s.comfy) SETUP_COMFY_KEYS.forEach(k => { if (k in s.comfy) comfyCfg[k] = s.comfy[k]; });
   selectedId = null;
-  $("genPrompt").value = s.gen_prompt || "";   // restore the Generate description so the render queue can regenerate this setup's prompt
   sourceImageDataUrl = beforeImage || s.sourceImage || null;   // restore the reference image (compare slider, and so re-renders keep it)
   sourceImageRef = beforeRef || s.sourceImageRef || null;
+  setGenContextFromSetup(s, beforeImage);   // so a queue "regenerate prompt" rebuilds THIS setup (not the live Generate-modal fields)
   saveComfyCfg();
   applyComfyForm();
   applyCanvasAspect();
