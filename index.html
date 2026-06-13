@@ -787,7 +787,8 @@
     <div class="modal-foot">
       <span class="status" id="genStatus"></span>
       <button id="genCancel">Cancel</button>
-      <button class="primary" id="genRun">Generate</button>
+      <button id="genRun">Generate</button>
+      <button class="primary" id="genRunRender" title="Generate the setup, then immediately send it to ComfyUI to render">Generate &amp; render</button>
     </div>
   </div>
 </div>
@@ -1792,7 +1793,7 @@ let genImageDataUrl = null;   // base64 data URL of an uploaded reference image,
 let sourceImageDataUrl = null;   // reference image the current setup was generated from (for the render compare slider); null if text-only / reset
 let sourceImageRef = null;       // proxy cache key for that image (persists the compare slider across reloads); null if not (yet) uploaded
 
-async function runGeneration() {
+async function runGeneration(alsoRender) {
   if (generating) return;
   const cfg = loadCfg();
   const userPrompt = $("genPrompt").value.trim();
@@ -1802,7 +1803,7 @@ async function runGeneration() {
   if (cfg.provider === "openrouter" && !cfg.apiKey) { setGenStatus("OpenRouter needs an API key (⚙ Settings).", "err"); openSettings(); return; }
 
   generating = true;
-  $("genRun").disabled = true;
+  $("genRun").disabled = $("genRunRender").disabled = true;
   setGenStatus('<span class="spinner"></span>' + (genImageDataUrl ? "Reading image…" : "Contacting model…"), "");
 
   const headers = { "Content-Type": "application/json" };
@@ -1842,14 +1843,19 @@ async function runGeneration() {
     if (sourceImageDataUrl) uploadRefImage(sourceImageDataUrl).then(k => { sourceImageRef = k; });   // cache on the proxy for persistence
     setGenStatus("Generated ✓", "ok");
     toast("Setup generated ✓", "ok");
-    setTimeout(closeGenModal, 600);
+    // Generate & render: hand the fresh setup straight to ComfyUI (fire-and-forget
+    // so the modal closes and render progress shows in the main view). Falls back
+    // to a plain generate when no ComfyUI server is configured.
+    if (alsoRender && comfyBase()) { closeGenModal(); comfyRender(); }
+    else if (alsoRender) { setGenStatus("Generated ✓ — set your ComfyUI server URL to render.", "ok"); setTimeout(closeGenModal, 1400); }
+    else setTimeout(closeGenModal, 600);
   } catch (err) {
     let msg = err.message || String(err);
     if (err instanceof TypeError) msg = "Network/CORS error reaching " + cfg.baseUrl + ". Check the URL, that the server is running, and that CORS is allowed.";
     setGenStatus(msg, "err");
   } finally {
     generating = false;
-    $("genRun").disabled = false;
+    $("genRun").disabled = $("genRunRender").disabled = false;
   }
 }
 
@@ -2118,7 +2124,8 @@ $("stage").addEventListener("click", () => { selectedId = null; renderCanvas(); 
 $("generateBtn").addEventListener("click", openGenModal);
 $("genClose").addEventListener("click", closeGenModal);
 $("genCancel").addEventListener("click", closeGenModal);
-$("genRun").addEventListener("click", runGeneration);
+$("genRun").addEventListener("click", () => runGeneration(false));
+$("genRunRender").addEventListener("click", () => runGeneration(true));
 let overlayPressedSelf = false;
 $("genOverlay").addEventListener("mousedown", e => { overlayPressedSelf = (e.target === $("genOverlay")); });
 $("genOverlay").addEventListener("click", e => { if (e.target === $("genOverlay") && overlayPressedSelf) closeGenModal(); });

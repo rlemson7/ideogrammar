@@ -37,7 +37,6 @@ import os
 import re
 import select
 import socket
-import sqlite3
 import sys
 import threading
 import zlib
@@ -59,19 +58,35 @@ ARGS = None  # set in main()
 # browsers/devices, with no practical size limit. A single global lock serialises
 # access — fine for a local single-user tool under ThreadingHTTPServer.
 _DB = None
+_DB_OK = None            # None = not yet tried; False = sqlite3 missing from this Python build
 _DB_LOCK = threading.Lock()
 
 
 def _db():
-    global _DB
-    if _DB is None:
-        _DB = sqlite3.connect(ARGS.db_path, check_same_thread=False)
-        _DB.execute("PRAGMA journal_mode=WAL")
-        # setups: ordered by insertion (rowid); name is the natural key.
-        _DB.execute("CREATE TABLE IF NOT EXISTS setups (name TEXT PRIMARY KEY, ts TEXT, data TEXT)")
-        # renders: full gallery entry as JSON, ts (ms) drives chronological order.
-        _DB.execute("CREATE TABLE IF NOT EXISTS renders (id INTEGER PRIMARY KEY, ts INTEGER, data TEXT)")
-        _DB.commit()
+    """Shared SQLite connection, or None if sqlite3 isn't built into this Python.
+    Imported lazily (like the vectorizer deps) so the proxy still starts on a
+    SQLite-less Python — the editor then falls back to browser localStorage.
+    Callers must hold _DB_LOCK (this may create the connection)."""
+    global _DB, _DB_OK
+    if _DB is not None:
+        return _DB
+    if _DB_OK is False:
+        return None
+    try:
+        import sqlite3
+    except Exception:
+        _DB_OK = False
+        sys.stderr.write("[db] sqlite3 unavailable in this Python build — "
+                         "gallery/setups fall back to browser localStorage\n")
+        return None
+    _DB_OK = True
+    _DB = sqlite3.connect(ARGS.db_path, check_same_thread=False)
+    _DB.execute("PRAGMA journal_mode=WAL")
+    # setups: ordered by insertion (rowid); name is the natural key.
+    _DB.execute("CREATE TABLE IF NOT EXISTS setups (name TEXT PRIMARY KEY, ts TEXT, data TEXT)")
+    # renders: full gallery entry as JSON, ts (ms) drives chronological order.
+    _DB.execute("CREATE TABLE IF NOT EXISTS renders (id INTEGER PRIMARY KEY, ts INTEGER, data TEXT)")
+    _DB.commit()
     return _DB
 
 
@@ -390,7 +405,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _db_get(self, table, order):
         with _DB_LOCK:
-            rows = _db().execute("SELECT data FROM %s ORDER BY %s" % (table, order)).fetchall()
+            db = _db()
+            rows = db.execute("SELECT data FROM %s ORDER BY %s" % (table, order)).fetchall() if db is not None else None
+        if rows is None:
+            self._json_error(503, "Gallery database unavailable (sqlite3 not built into this Python)")
+            return
         items = []
         for (data,) in rows:
             try:
@@ -412,12 +431,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with _DB_LOCK:
                 db = _db()
+                if db is None:
+                    raise RuntimeError("sqlite3 not built into this Python")
                 db.execute("DELETE FROM %s" % table)
                 for sql, params in rows_from_items(items):
                     db.execute(sql, params)
                 db.commit()
         except Exception as e:
-            self._json_error(500, "Database write failed: %s" % e)
+            self._json_error(503, "Database write failed: %s" % e)
             return
         self._send_json({"ok": True, "count": len(items)})
 
