@@ -798,6 +798,15 @@
           </div>
         </div>
       </div>
+      <div id="genImageMode" style="display:none; margin-top:12px;">
+        <label>From the image, take…</label>
+        <div class="seg" id="genExtractSeg" style="flex-wrap:wrap;">
+          <button type="button" data-x="full" class="active">Full setup</button>
+          <button type="button" data-x="composition">Composition only</button>
+          <button type="button" data-x="style">Style only</button>
+        </div>
+        <div class="hint" id="genExtractHint" style="margin-top:6px;">Build a complete new setup from the image (style, composition and content).</div>
+      </div>
       <div class="hint">The model returns the full schema (style, background, positioned objects). You can edit everything afterwards. Press ⌘/Ctrl + Enter to generate.</div>
     </div>
     <div class="modal-foot">
@@ -1804,8 +1813,25 @@ REFINEMENT MODE: You are given an EXISTING setup as JSON and a change request. R
 
 const ELEMENT_REFINE_SYSTEM_PROMPT = `You rewrite ONE element's description for an Ideogram 4 image-layout prompt. You are given the overall scene (for context only), the element's type, its current description, and a change request. Return ONLY the rewritten description as a single concise, vivid plain-text line — no JSON, no quotes, no field names, no preamble, no explanation. Apply the change request and keep the rest faithful to the current description; if the current description is empty, write one from the request. For a "text" element, keep or produce the literal words to render. Do not describe other elements or the whole scene — only this one element.`;
 
+// Transfer ONLY the composition from a reference image onto the current setup,
+// keeping the setup's style/colors/content. Outputs the full setup schema.
+const COMPOSITION_TRANSFER_SYSTEM_PROMPT = SYSTEM_PROMPT + `
+
+COMPOSITION-TRANSFER MODE: You are given an EXISTING setup as JSON and a reference IMAGE. Return the COMPLETE updated setup in the exact same schema, changed in ONE way only: rearrange it so its LAYOUT matches the reference image. Move and resize the existing elements so each sits where the corresponding element sits in the image, and follow the image's overall composition — its focal placement, balance, scale relationships and crop. Map the setup's elements onto the image's arrangement by role (the main subject to the image's main subject, titles/text to where text sits, secondary objects to the remaining placements).
+
+KEEP everything else byte-for-byte from the given setup: the SAME style_description (aesthetics, lighting, photo, medium, color_palette), the SAME element descriptions, types, fonts and per-element color_palette, the SAME background and high_level_description text. Do NOT adopt the image's colors, palette, art style, medium, lighting, subjects, or any text in it — take ONLY its spatial arrangement (the bbox of each element). Keep the same set of elements; add or remove one only if the image's arrangement clearly demands it, and describe any addition in the setup's existing style and palette. Return JSON only.`;
+
+// Transfer ONLY the style from a reference image onto the current setup, keeping the
+// setup's composition and content. Outputs the full setup schema.
+const STYLE_TRANSFER_SYSTEM_PROMPT = SYSTEM_PROMPT + `
+
+STYLE-TRANSFER MODE: You are given an EXISTING setup as JSON and a reference IMAGE. Return the COMPLETE updated setup in the exact same schema, changed in ONE way only: restyle it to match the reference image's LOOK. Rewrite style_description.aesthetics, .lighting, .photo and .medium to describe the image's art direction, rendering, mood and lighting; set style_description.color_palette to the image's dominant colors (3 to 6 UPPERCASE 6-digit hex); and update each element's color_palette to the matching colors drawn from the image.
+
+KEEP the composition and content identical to the given setup: the SAME elements in the SAME order, the SAME types, the SAME bbox for every element (do not move, resize, add or remove anything), the SAME fonts, and the SAME subject/words of every element description and the background — you may only adjust COLOR words inside a description to fit the new palette. Take ONLY the image's visual style and colors; do NOT take its subjects, objects, layout or any text. Return JSON only.`;
+
 let generating = false;
 let genImageDataUrl = null;   // base64 data URL of an uploaded reference image, or null
+let genExtractMode = "full";  // "full" | "composition" | "style": what to pull from the uploaded image
 let sourceImageDataUrl = null;   // reference image the current setup was generated from (for the render compare slider); null if text-only / reset
 let sourceImageRef = null;       // proxy cache key for that image (persists the compare slider across reloads); null if not (yet) uploaded
 
@@ -1821,13 +1847,17 @@ let genContext = { prompt: "", image: null };
 //   opts.context  — {prompt, image} to generate from instead of the live Generate
 //                   fields (used by the render queue to regenerate the loaded setup).
 //   opts.guidance — extra steering folded into the prompt (queue Guidance field).
+//   opts.extract  — "composition" | "style": pull ONLY that aspect from the uploaded
+//                   image and MERGE it into the current setup, keeping the other half.
 // With no opts it reads the Generate-modal description + uploaded image as before.
 async function generateSetup(opts = {}) {
   const cfg = loadCfg();
   const ctx = opts.context || null;
+  const extract = opts.extract || null;   // "composition" | "style" | null
   const userPrompt = (ctx ? (ctx.prompt || "") : $("genPrompt").value).trim();
   const image = ctx ? (ctx.image || null) : genImageDataUrl;
   const guide = (opts.guidance || "").trim();   // steers every regenerated prompt in a queue (e.g. "make it photorealistic")
+  if (extract && !image) throw new Error("Upload an image to extract its " + (extract === "style" ? "style" : "composition") + ".");
   if (!userPrompt && !image) throw new Error("Describe the image, or upload one, in ✨ Generate first.");
   if (!cfg.baseUrl) throw new Error("Set a Base URL in ⚙ Settings.");
   if (!cfg.model) throw new Error("Set a Model name in ⚙ Settings.");
@@ -1838,7 +1868,21 @@ async function generateSetup(opts = {}) {
   if (cfg.provider === "openrouter") { headers["HTTP-Referer"] = location.origin; headers["X-Title"] = "Ideogrammar"; }
 
   let systemContent, userContent;
-  if (image) {
+  if (extract === "composition" || extract === "style") {
+    // Transfer one aspect of the reference image onto the CURRENT setup: the model
+    // sees the setup JSON + the image and returns the full setup with only the
+    // composition (bboxes) OR only the style/palette changed.
+    systemContent = extract === "style" ? STYLE_TRANSFER_SYSTEM_PROMPT : COMPOSITION_TRANSFER_SYSTEM_PROMPT;
+    const ask = extract === "style"
+      ? "Restyle the setup below to match the reference image's look and colors, keeping its composition and content. Reference image attached."
+      : "Rearrange the setup below to match the reference image's composition, keeping its style, colors and content. Reference image attached.";
+    userContent = [
+      { type: "text", text: ask + (guide ? " Extra guidance: " + guide : "") + "\n\nCurrent setup:\n" + JSON.stringify(buildLayoutJSON(), null, 2) },
+      { type: "image_url", image_url: { url: image } }
+    ];
+    // No detailDirective here — transfer must preserve the existing element set, not
+    // re-impose an element count.
+  } else if (image) {
     systemContent = IMAGE_SYSTEM_PROMPT;
     const extra = [userPrompt, guide].filter(Boolean).join(" — ");
     const text = extra
@@ -1848,11 +1892,12 @@ async function generateSetup(opts = {}) {
       { type: "text", text },
       { type: "image_url", image_url: { url: image } }
     ];
+    systemContent += detailDirective(cfg);   // honor the element-count / description-detail settings
   } else {
     systemContent = SYSTEM_PROMPT;
     userContent = "Description:\n" + userPrompt + (guide ? "\n\nGuidance (apply to the whole composition): " + guide : "");
+    systemContent += detailDirective(cfg);
   }
-  systemContent += detailDirective(cfg);   // honor the element-count / description-detail settings
 
   const body = {
     model: cfg.model,
@@ -1869,6 +1914,18 @@ async function generateSetup(opts = {}) {
   }
   const parsed = extractJSON(content);
   if (!parsed) throw new Error("Could not parse JSON from the model's reply.");
+  // Transfer modes return a full setup that changed only one aspect; merge it like
+  // a refine (carry per-element vectorize modes by position, keep disabled elements
+  // the model never saw) and leave the queue genContext / compare reference alone.
+  if (extract === "composition" || extract === "style") {
+    const prevVec = state.elements.filter(e => e.enabled !== false).map(e => e.vectorize || "auto");
+    const disabledEls = state.elements.filter(e => e.enabled === false);
+    loadFromJSON(parsed);
+    state.elements.forEach((e, i) => { if (prevVec[i]) e.vectorize = prevVec[i]; });
+    if (disabledEls.length) state.elements.push(...disabledEls);
+    render();
+    return;
+  }
   loadFromJSON(parsed);
   sourceImageDataUrl = image || null;   // remember it so renders can compare against the reference
   sourceImageRef = null;
@@ -1887,14 +1944,17 @@ function currentGenContext() {
 
 async function runGeneration(alsoRender) {
   if (generating) return;
+  const extract = (genImageDataUrl && genExtractMode !== "full") ? genExtractMode : null;
   generating = true;
   $("genRun").disabled = $("genRunRender").disabled = true;
-  setGenStatus('<span class="spinner"></span>' + (genImageDataUrl ? "Reading image…" : "Contacting model…"), "");
+  const busy = extract === "composition" ? "Applying the image's composition…" : extract === "style" ? "Applying the image's style…" : (genImageDataUrl ? "Reading image…" : "Contacting model…");
+  setGenStatus('<span class="spinner"></span>' + busy, "");
 
   try {
-    await generateSetup();
-    setGenStatus("Generated ✓", "ok");
-    toast("Setup generated ✓", "ok");
+    await generateSetup({ extract });
+    const okMsg = extract === "composition" ? "Composition applied ✓ (style kept)" : extract === "style" ? "Style applied ✓ (composition kept)" : "Generated ✓";
+    setGenStatus(okMsg, "ok");
+    toast(okMsg, "ok");
     // Generate & render: hand the fresh setup straight to ComfyUI (fire-and-forget
     // so the modal closes and render progress shows in the main view). Falls back
     // to a plain generate when no ComfyUI server is configured.
@@ -1982,6 +2042,7 @@ function setGenImage(file) {
     $("genImageName").textContent = file.name + " · " + img.naturalWidth + "×" + img.naturalHeight + (scale < 1 ? " → " + w + "×" + h : "") + " · ~" + kb + " KB";
     $("genImageHint").style.display = "none";
     $("genImagePreview").style.display = "flex";
+    $("genImageMode").style.display = "block";   // offer composition/style extraction
     setGenStatus("", "");
   };
   img.onerror = () => { URL.revokeObjectURL(url); setGenStatus("Could not read that image file.", "err"); };
@@ -1993,6 +2054,18 @@ function clearGenImage() {
   $("genImageThumb").src = "";
   $("genImagePreview").style.display = "none";
   $("genImageHint").style.display = "block";
+  $("genImageMode").style.display = "none";
+  setGenExtractMode("full");   // reset so a later text generation isn't stuck in extract mode
+}
+const GEN_EXTRACT_HINTS = {
+  full: "Build a complete new setup from the image (style, composition and content).",
+  composition: "Rearrange the current setup to match the image's layout — repositions your elements, keeps their descriptions, colors and style.",
+  style: "Restyle the current setup to match the image's look and colors — keeps your composition, elements and text."
+};
+function setGenExtractMode(mode) {
+  genExtractMode = mode;
+  document.querySelectorAll("#genExtractSeg button").forEach(b => b.classList.toggle("active", b.dataset.x === mode));
+  $("genExtractHint").textContent = GEN_EXTRACT_HINTS[mode] || GEN_EXTRACT_HINTS.full;
 }
 // Set genContext (the inputs the render queue regenerates from) to match a loaded
 // setup, WITHOUT touching the live Generate-modal fields — those belong to the next
@@ -2218,6 +2291,9 @@ document.addEventListener("keydown", e => { if (e.key === "Escape" && $("genOver
 $("genImageDrop").addEventListener("click", e => { if (!e.target.closest("#genImagePreview")) $("genImageInput").click(); });
 $("genImageInput").addEventListener("change", e => { if (e.target.files[0]) setGenImage(e.target.files[0]); });
 $("genImageClear").addEventListener("click", clearGenImage);
+document.querySelectorAll("#genExtractSeg button").forEach(btn => {
+  btn.addEventListener("click", () => setGenExtractMode(btn.dataset.x));
+});
 $("genImageDrop").addEventListener("dragover", e => { e.preventDefault(); $("genImageDrop").classList.add("dragover"); });
 $("genImageDrop").addEventListener("dragleave", () => $("genImageDrop").classList.remove("dragover"));
 $("genImageDrop").addEventListener("drop", e => {

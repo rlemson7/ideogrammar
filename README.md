@@ -17,6 +17,7 @@ Everything lives in [`index.html`](index.html) (HTML + CSS + vanilla JS, no depe
 - **Font-style picker** — `text` and `logo` elements get a typography picker: choose a preset style (each previewed in a matching, self-hosted web font — works fully offline) or type your own descriptor. The chosen style is injected into that element's prompt as a `font` field and round-trips through save/load and LLM refine.
 - **Live JSON output** — syntax-highlighted, copy or download with one click.
 - **Generate prompt** — describe the image in plain language, **or upload/drop a reference image** (with a vision-capable model), and an OpenAI-compatible LLM (OpenRouter or a local `llama.cpp` server) fills in the whole schema. Settings are stored in `localStorage`.
+- **Composition / style transfer** — use an uploaded image to **rearrange the current setup to the image's layout** (keeping its style) or **restyle it to the image's look** (keeping its composition), instead of a full rebuild — so you can mix a layout from one image with a look from another.
 - **Refine** — ask the LLM to adjust the current setup with a plain-language change (e.g. "make it a lighter composition"); it rewrites the whole setup while keeping everything the request doesn't touch.
 - **ComfyUI mode** — render the current prompt on your ComfyUI server using the bundled Ideogram 4 workflow, with every workflow parameter exposed and the result (plus live progress) shown in the editor. A **✕ Cancel** button interrupts a render in progress. Renders collect in a gallery with a full-size viewer, and can be saved permanently.
 - **Queue multiple renders** — run a setup *N* times in a row from the ComfyUI panel (**Queue multiple renders**), each result landing in the History gallery and the running `1/N` counter shown beside the progress bar. Tick **Randomize seed each iteration** to vary the noise per render, and/or **Regenerate prompt each iteration** to re-run the LLM on your ✨ Generate description before every render so the wording *and* the seed change each time. A **Guidance** field steers every regenerated prompt with a shared instruction (e.g. *make it photorealistic*), keeping the whole queue on-direction. Sequential (one at a time, so it never overruns a single GPU); **✕ Cancel** stops the whole run.
@@ -78,6 +79,14 @@ Any other OpenAI-compatible endpoint works too — just set the base URL to the 
 Then click **✨ Generate prompt**, describe the image, and the model returns the full schema, which you can edit visually. Settings/presets are saved in your browser only.
 
 **From an image.** In the same dialog you can **click or drag-drop a reference image** instead of, or alongside, the text (large photos are downscaled automatically, so size isn't a concern). The model reads the image's subject, style, lighting, colors and any literal text, then reconstructs it as a full editable setup — estimating each element's position on the 1000×1000 canvas. The text box, when used together with an image, acts as extra guidance. This needs a **vision-capable model** (e.g. `anthropic/claude-3.5-sonnet`, `openai/gpt-4o`); a text-only model will reject the image.
+
+**Transfer only the composition or only the style.** When an image is uploaded, a **From the image, take…** selector appears with three modes:
+
+- **Full setup** (default) — reconstruct the whole image as above.
+- **Composition only** — keep the **current setup's style, colors and content**, and only **rearrange it** so its layout matches the reference image — your existing elements are repositioned and resized to follow the image's composition (focal placement, balance, crop), without adopting the image's colors, style or subjects.
+- **Style only** — keep the **current setup's composition** (the same elements in the same places, same text), and only **restyle it** to match the reference image's look — aesthetics, lighting, medium and color palette are rewritten to the image's, while what each element depicts and where it sits stay put.
+
+Each mode sends the model your current setup *plus* the image and asks it to change only that one aspect (the same round-trip Refine uses, with an image attached), so the other half of your setup is preserved. Run the two in turn to mix a composition from one image with a style from another. Both need a vision-capable model.
 
 ## Refine (LLM)
 
