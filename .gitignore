@@ -17,6 +17,11 @@ models/
 # cached reference images for the before/after compare slider
 .ideogrammar_refimg/
 
+# gallery + saved-setups database (SQLite, incl. WAL sidecar files)
+.ideogrammar.db
+.ideogrammar.db-wal
+.ideogrammar.db-shm
+
 # python bytecode
 __pycache__/
 *.pyc

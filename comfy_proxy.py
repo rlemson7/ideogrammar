@@ -37,6 +37,7 @@ import os
 import re
 import select
 import socket
+import sqlite3
 import sys
 import threading
 import zlib
@@ -50,6 +51,28 @@ HOP_BY_HOP = {
 }
 
 ARGS = None  # set in main()
+
+# ---- gallery + setups database (SQLite, stdlib) ----
+# The editor used to keep its render gallery and saved setups in the browser's
+# localStorage (≈5 MB, hence the old 300-render cap and the dropping of reference
+# images). We persist them server-side instead: one SQLite file, shared across
+# browsers/devices, with no practical size limit. A single global lock serialises
+# access — fine for a local single-user tool under ThreadingHTTPServer.
+_DB = None
+_DB_LOCK = threading.Lock()
+
+
+def _db():
+    global _DB
+    if _DB is None:
+        _DB = sqlite3.connect(ARGS.db_path, check_same_thread=False)
+        _DB.execute("PRAGMA journal_mode=WAL")
+        # setups: ordered by insertion (rowid); name is the natural key.
+        _DB.execute("CREATE TABLE IF NOT EXISTS setups (name TEXT PRIMARY KEY, ts TEXT, data TEXT)")
+        # renders: full gallery entry as JSON, ts (ms) drives chronological order.
+        _DB.execute("CREATE TABLE IF NOT EXISTS renders (id INTEGER PRIMARY KEY, ts INTEGER, data TEXT)")
+        _DB.commit()
+    return _DB
 
 
 def comfy_host_port():
@@ -356,6 +379,66 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # ---- gallery + setups store (SQLite) ----
+    # The editor mirrors its whole render list / setup list here on change and
+    # reads them back on load. Bulk replace-all keeps the browser logic simple:
+    # the editor stays the source of truth in memory; this is durable storage.
+    def _read_json_body(self):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        raw = self.rfile.read(length) if length else b"{}"
+        return json.loads(raw or b"{}")
+
+    def _db_get(self, table, order):
+        with _DB_LOCK:
+            rows = _db().execute("SELECT data FROM %s ORDER BY %s" % (table, order)).fetchall()
+        items = []
+        for (data,) in rows:
+            try:
+                items.append(json.loads(data))
+            except Exception:
+                pass
+        self._send_json({"items": items})
+
+    def _db_replace(self, table, rows_from_items):
+        try:
+            body = self._read_json_body()
+        except Exception:
+            self._json_error(400, "Invalid JSON body")
+            return
+        items = body.get("items")
+        if not isinstance(items, list):
+            self._json_error(400, "Expected an 'items' array")
+            return
+        try:
+            with _DB_LOCK:
+                db = _db()
+                db.execute("DELETE FROM %s" % table)
+                for sql, params in rows_from_items(items):
+                    db.execute(sql, params)
+                db.commit()
+        except Exception as e:
+            self._json_error(500, "Database write failed: %s" % e)
+            return
+        self._send_json({"ok": True, "count": len(items)})
+
+    def _db_put_setups(self):
+        def rows(items):
+            for it in items:
+                name = (it.get("name") or "").strip()
+                if not name:
+                    continue
+                yield ("INSERT OR REPLACE INTO setups(name, ts, data) VALUES (?,?,?)",
+                       (name, str(it.get("ts") or ""), json.dumps(it)))
+        self._db_replace("setups", rows)
+
+    def _db_put_renders(self):
+        def rows(items):
+            for it in items:
+                ts = it.get("ts")
+                ts = int(ts) if isinstance(ts, (int, float)) else 0
+                yield ("INSERT INTO renders(ts, data) VALUES (?,?)", (ts, json.dumps(it)))
+        self._db_replace("renders", rows)
+
     def _serve_file(self, fpath):
         ctype = mimetypes.guess_type(fpath)[0] or "application/octet-stream"
         try:
@@ -387,6 +470,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/ideogrammar/outputs":
             self._list_outputs()
             return
+        if path == "/ideogrammar/setups":
+            self._db_get("setups", "rowid")
+            return
+        if path == "/ideogrammar/renders":
+            self._db_get("renders", "ts, id")
+            return
         if path.startswith("/ideogrammar/refimg/"):
             self._serve_refimg(path[len("/ideogrammar/refimg/"):])
             return
@@ -407,9 +496,24 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/ideogrammar/refimg":
             self._store_refimg()
             return
+        # POST is accepted alongside PUT so the editor can flush via
+        # navigator.sendBeacon() on page unload (beacons are always POST).
+        if p == "/ideogrammar/setups":
+            self._db_put_setups()
+            return
+        if p == "/ideogrammar/renders":
+            self._db_put_renders()
+            return
         self._proxy()
 
     def do_PUT(self):
+        p = self.path.split("?", 1)[0]
+        if p == "/ideogrammar/setups":
+            self._db_put_setups()
+            return
+        if p == "/ideogrammar/renders":
+            self._db_put_renders()
+            return
         self._proxy()
 
     def do_DELETE(self):
@@ -1289,6 +1393,7 @@ def main():
     p.add_argument("--html", default=os.path.join(here, "index.html"), help="path to index.html")
     p.add_argument("--output-dir", default="", help="ComfyUI output/ folder (readable by this proxy) — enables gallery recovery via the editor's Rescan button, surviving ComfyUI restarts")
     p.add_argument("--ref-dir", default=os.environ.get("IDEOGRAMMAR_REF_DIR", os.path.join(here, ".ideogrammar_refimg")), help="where to cache reference images for the before/after compare slider (env: IDEOGRAMMAR_REF_DIR)")
+    p.add_argument("--db-path", default=os.environ.get("IDEOGRAMMAR_DB", os.path.join(here, ".ideogrammar.db")), help="SQLite file for the render gallery + saved setups (env: IDEOGRAMMAR_DB)")
     p.add_argument("--timeout", type=float, default=600.0, help="upstream timeout (s)")
     p.add_argument("--verbose", action="store_true", help="log every request")
     ARGS = p.parse_args()
@@ -1303,6 +1408,7 @@ def main():
         ok = os.path.isdir(ARGS.output_dir)
         print("  output dir: %s%s" % (ARGS.output_dir, "" if ok else "  (NOT a readable folder — gallery recovery disabled)"))
     print("  ref images: %s" % ARGS.ref_dir)
+    print("  gallery db: %s" % ARGS.db_path)
     print("  editor Server URL: leave blank (uses this origin) or set %s" % url.rstrip("/"))
     _sam_ckpt = os.environ.get("SAM_CHECKPOINT")
     if not _sam_ckpt:

@@ -346,6 +346,15 @@
   /* saved-setup marker: a small star badge in the thumb corner */
   .gallery .thumb.saved { border-color: var(--accent-2); }
   .gallery .thumb .setup-badge { position: absolute; top: 2px; left: 2px; width: 15px; height: 15px; border-radius: 50%; background: var(--accent); color: #fff; font-size: 9px; line-height: 15px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,.5); pointer-events: none; }
+  /* delete affordance on every thumb: revealed on hover */
+  .gallery .thumb .thumb-del { position: absolute; top: 2px; right: 2px; width: 15px; height: 15px; padding: 0; border: none; border-radius: 50%; background: rgba(0,0,0,.6); color: #fff; font-size: 9px; line-height: 15px; text-align: center; cursor: pointer; opacity: 0; transition: opacity .12s, background .12s; }
+  .gallery .thumb:hover .thumb-del { opacity: 1; }
+  .gallery .thumb .thumb-del:hover { background: var(--danger); }
+  /* render whose image failed to load (404 after ComfyUI restart, etc.) */
+  .gallery .thumb.broken { border-color: var(--danger); }
+  .gallery .thumb.broken img { opacity: .25; }
+  .gallery .thumb.broken::after { content: "⚠"; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 18px; color: var(--danger); pointer-events: none; }
+  .gallery .thumb.broken .thumb-del { opacity: 1; }   /* always show delete on broken thumbs */
 
   /* ---------- image viewer modal ---------- */
   .img-modal { position: relative; display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 10px; max-width: 96vw; }
@@ -2698,11 +2707,67 @@ function addRenderToHistory(entry) {
   galleryPage = 0;   // jump to the page that shows the newest render
   renderGallery();
 }
-// Persist only permanent (output/) renders — temp previews would 404 after a reload.
-// Keep the reference image (_before) on the most recent few image-sourced renders so
-// the compare slider survives a reload; shed those first (then oldest entries) on quota.
-const BEFORE_PERSIST = 16;   // how many recent renders keep their (heavy) reference image
+/* ---- durable store (proxy SQLite, with a localStorage fallback) ----
+   The render gallery and saved setups used to live in browser localStorage —
+   ~5 MB, which forced the 300-render cap and the dropping of reference images.
+   We now mirror both to a SQLite DB on the proxy (no size cap, shared across
+   browsers/devices). renderHistory + setupsCache stay the in-memory source of
+   truth; this layer just persists them. When the proxy DB is unreachable
+   (direct-to-ComfyUI mode, file://) we transparently fall back to localStorage
+   and the original 300-cap behaviour, so the editor still works standalone. */
+let dbOK = false;          // proxy DB reachable (decided once, at bootstrap)
+let storeReady = false;    // initial load finished — guards write-through so we never clobber the store with a half-loaded state
+const DB_MIGRATED_KEY = "ideogram_db_migrated";
+// The DB lives on the proxy that served this page; address it by page origin.
+function dbBase() {
+  if (location.protocol === "http:" || location.protocol === "https:") return location.origin;
+  return (typeof comfyCfg === "object" && comfyCfg.url ? comfyCfg.url : "").trim().replace(/\/+$/, "");
+}
+// Strip a setup's inline base64 reference image before persisting — the compare
+// slider uses the (tiny, content-addressed) sourceImageRef key instead.
+function setupForStore(x) {
+  return (x.setup && x.setup.sourceImage) ? { ...x, setup: (({ sourceImage, ...s }) => s)(x.setup) } : x;
+}
+// The render rows we persist: permanent (output/) renders only, minus the heavy
+// inline _before image (the slider falls back to _beforeRef on disk).
+function rendersForStore() {
+  return renderHistory.filter(e => e.type === "output").map(({ _before, ...x }) => x);
+}
+function setupsForStore() { return setupsCache.map(setupForStore); }
+const _syncTimers = {};
+function scheduleStoreSync(kind) {
+  clearTimeout(_syncTimers[kind]);
+  _syncTimers[kind] = setTimeout(() => { _syncTimers[kind] = null; pushStore(kind); }, 400);
+}
+async function pushStore(kind) {
+  const items = kind === "setups" ? setupsForStore() : rendersForStore();
+  try {
+    await fetch(dbBase() + "/ideogrammar/" + kind, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items })
+    });
+  } catch (_) { /* transient; the next change or the unload beacon will retry */ }
+}
+// Flush any pending writes synchronously on page hide (beacons survive unload).
+function flushStore() {
+  if (!storeReady || !dbOK) return;
+  for (const kind of ["setups", "renders"]) {
+    if (!_syncTimers[kind]) continue;
+    clearTimeout(_syncTimers[kind]); _syncTimers[kind] = null;
+    const items = kind === "setups" ? setupsForStore() : rendersForStore();
+    try { navigator.sendBeacon(dbBase() + "/ideogrammar/" + kind, new Blob([JSON.stringify({ items })], { type: "application/json" })); } catch (_) {}
+  }
+}
+window.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") flushStore(); });
+window.addEventListener("pagehide", flushStore);
+
+// Persist the render gallery (DB when available, else the original localStorage store).
+const BEFORE_PERSIST = 16;   // (localStorage fallback) how many recent renders keep their (heavy) reference image
 function saveRenderHistory() {
+  if (!storeReady) return;
+  if (dbOK) scheduleStoreSync("renders");
+  else legacySaveRenderHistory();
+}
+function legacySaveRenderHistory() {
   const arr = renderHistory.filter(e => e.type === "output").slice(-HIST_MAX);
   // Keep _before only on the newest BEFORE_PERSIST renders that have one.
   const keep = new Set();
@@ -2719,18 +2784,68 @@ function saveRenderHistory() {
   }
   try { localStorage.setItem(HIST_KEY, "[]"); } catch (_) {}
 }
-function loadRenderHistory() {
+// Read the localStorage-stored render list into a plain array (ts backfilled so
+// legacy entries sort as oldest while preserving stored order).
+function legacyReadHistory() {
   try {
     const a = JSON.parse(localStorage.getItem(HIST_KEY));
-    if (Array.isArray(a)) {
-      // Backfill a small ascending ts for legacy entries so they sort as oldest, preserving stored order.
-      a.forEach((e, i) => { if (typeof e.ts !== "number") e.ts = i + 1; });
-      renderHistory.push(...a);
-      viewerIndex = renderHistory.length - 1;
-    }
+    if (Array.isArray(a)) { a.forEach((e, i) => { if (typeof e.ts !== "number") e.ts = i + 1; }); return a; }
   } catch (_) {}
+  return [];
+}
+// Bootstrap: load gallery + setups from the proxy DB (falling back to
+// localStorage), importing any legacy localStorage data into an empty DB once.
+async function bootstrapStore() {
+  const base = dbBase();
+  try {
+    const [sr, rr] = await Promise.all([
+      fetch(base + "/ideogrammar/setups"),
+      fetch(base + "/ideogrammar/renders"),
+    ]);
+    if (sr.ok && rr.ok) {
+      dbOK = true;
+      setupsCache = (await sr.json()).items || [];
+      const items = (await rr.json()).items || [];
+      renderHistory.push(...items);
+      viewerIndex = renderHistory.length - 1;
+      await migrateLegacyIntoDb();
+    }
+  } catch (_) { dbOK = false; }
+  if (!dbOK) {   // no proxy DB — use localStorage exactly as before
+    setupsCache = legacyReadSetups();
+    renderHistory.push(...legacyReadHistory());
+    viewerIndex = renderHistory.length - 1;
+  }
+  storeReady = true;
+  refreshSetupList();
+  renderGallery();
+}
+// One-time copy of any localStorage gallery/setups into a fresh (empty) DB, so
+// existing users keep their data on first run against the new backend.
+async function migrateLegacyIntoDb() {
+  if (localStorage.getItem(DB_MIGRATED_KEY)) return;
+  if (setupsCache.length || renderHistory.length) { localStorage.setItem(DB_MIGRATED_KEY, "1"); return; }  // DB already has data
+  const ls = legacyReadSetups(), lh = legacyReadHistory();
+  if (ls.length || lh.length) {
+    setupsCache = ls;
+    renderHistory.push(...lh);
+    viewerIndex = renderHistory.length - 1;
+    await Promise.all([pushStore("setups"), pushStore("renders")]);
+    toast("Gallery & setups moved to the database ✓", "ok");
+  }
+  localStorage.setItem(DB_MIGRATED_KEY, "1");
 }
 function clearRenderHistory() { renderHistory.length = 0; viewerIndex = 0; saveRenderHistory(); renderGallery(); }
+// Remove a single render from the gallery (by its renderHistory index). The
+// saved setup it may reference is untouched — those are managed in Settings.
+function deleteRenderEntry(i) {
+  if (i < 0 || i >= renderHistory.length) return;
+  renderHistory.splice(i, 1);
+  if (viewerIndex > i) viewerIndex--;
+  viewerIndex = Math.max(0, Math.min(viewerIndex, renderHistory.length - 1));
+  saveRenderHistory();
+  renderGallery();
+}
 
 const GALLERY_PAGE_SIZE = 48;   // thumbnails rendered per page (avoids loading hundreds of images at once)
 let galleryPage = 0;
@@ -2756,9 +2871,17 @@ function renderGallery() {
     t.title = (it.setupName ? "Setup: " + it.setupName + " · " : "") + "Seed " + it.seed + " · " + it.aspect + (it.time ? " · " + it.time : "");
     const im = document.createElement("img");
     im.src = viewUrl(it); im.alt = "render " + (i + 1); im.loading = "lazy";
+    im.addEventListener("error", () => { t.classList.add("broken"); t.title = "Image unavailable — " + t.title; });
     if (it.rotation) im.style.transform = "rotate(" + it.rotation + "deg)";
     t.appendChild(im);
     if (it.setupName) { const b = document.createElement("div"); b.className = "setup-badge"; b.textContent = "★"; t.appendChild(b); }
+    // Remove this render from the gallery — works for every thumb, including
+    // broken (404) ones. Saved setups live separately and stay in Settings.
+    const del = document.createElement("button");
+    del.className = "thumb-del"; del.textContent = "✕";
+    del.title = "Remove this render from the gallery";
+    del.addEventListener("click", e => { e.stopPropagation(); deleteRenderEntry(i); });
+    t.appendChild(del);
     t.addEventListener("click", () => openImgModal(i));
     g.appendChild(t);
   });
@@ -3036,14 +3159,22 @@ function deleteSelectedLlmPreset() {
 /* ---- setups: full prompt + render-param snapshots ---- */
 const SETUPS_KEY = "ideogram_setups";
 let loadedSetupName = null;   // name of the saved setup currently being edited; null = none (Save then acts as Save as)
-function loadSetups() { try { const a = JSON.parse(localStorage.getItem(SETUPS_KEY)); return Array.isArray(a) ? a : []; } catch (_) { return []; } }
+let setupsCache = [];   // in-memory source of truth, mirrored to the proxy DB (or localStorage) by storeSetups
+function loadSetups() { return setupsCache; }
 function storeSetups(a) {
+  setupsCache = Array.isArray(a) ? a : [];
+  if (!storeReady) return;
+  if (dbOK) scheduleStoreSync("setups");
+  else legacyStoreSetups(setupsCache);
+}
+function legacyReadSetups() { try { const a = JSON.parse(localStorage.getItem(SETUPS_KEY)); return Array.isArray(a) ? a : []; } catch (_) { return []; } }
+function legacyStoreSetups(a) {
   try { localStorage.setItem(SETUPS_KEY, JSON.stringify(a)); }
   catch (_) {
     // Likely a quota overflow from stored reference images — drop them and retry
     // so the setups themselves still save (the compare slider just won't persist).
     try {
-      localStorage.setItem(SETUPS_KEY, JSON.stringify(a.map(x => x.setup && x.setup.sourceImage ? { ...x, setup: (({ sourceImage, ...s }) => s)(x.setup) } : x)));
+      localStorage.setItem(SETUPS_KEY, JSON.stringify(a.map(setupForStore)));
       toast("Setups saved, but reference images were too large to keep.", "bad");
     } catch (_) {}
   }
@@ -3247,16 +3378,23 @@ function loadSelectedSetup() {
 function deleteSelectedSetup() {
   const i = parseInt($("setupSel").value, 10);
   const arr = loadSetups();
-  if (isNaN(i) || !arr[i]) return;
-  if (!confirm("Delete setup “" + arr[i].name + "”?")) return;
-  const delName = arr[i].name;
-  if (delName === loadedSetupName) loadedSetupName = null;
-  // Clear the saved-setup tag from any gallery render that carried it (the
-  // render itself stays in history; it just loses the star badge).
+  if (!isNaN(i) && arr[i]) deleteSetupByName(arr[i].name);
+}
+// Delete a saved setup by name. The gallery renders that carried it stay in
+// history — they just lose the star badge (a setup can also outlive the render
+// that produced it, once that render is trimmed past HIST_MAX). Returns false
+// if there is no such setup or the user cancels.
+function deleteSetupByName(name) {
+  const arr = loadSetups();
+  const i = arr.findIndex(s => s.name === name);
+  if (i < 0) return false;
+  if (!confirm("Delete setup “" + name + "”?")) return false;
+  if (name === loadedSetupName) { loadedSetupName = null; updateSetupUI(); }
   let touched = false;
-  renderHistory.forEach(e => { if (e.setupName === delName) { delete e.setupName; touched = true; } });
+  renderHistory.forEach(e => { if (e.setupName === name) { delete e.setupName; touched = true; } });
   arr.splice(i, 1); storeSetups(arr); refreshSetupList();
   if (touched) { saveRenderHistory(); renderGallery(); }
+  return true;
 }
 
 let lastSvgUrl = null;
@@ -3760,8 +3898,8 @@ sanitizeComfyCfg();
 saveComfyCfg();
 applyComfyForm();
 updateComfyTarget();
-loadRenderHistory();
-renderGallery();
+renderGallery();        // empty first paint; bootstrapStore() fills the gallery + setups once storage loads
+bootstrapStore();
 applyMode();
 render();
 applyCanvasAspect();
