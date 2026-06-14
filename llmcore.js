@@ -154,7 +154,7 @@ function extractJSON(text) {
 /* ---- ComfyUI workflow template ---- */
 const WORKFLOW_TEMPLATE = {
   "25": { inputs: { images: ["98:13", 0] }, class_type: "PreviewImage", _meta: { title: "Preview Image" } },
-  "37": { inputs: { aspect_ratio: "1:1 (Square)", megapixels: 2 }, class_type: "ResolutionSelector", _meta: { title: "Resolution Selector" } },
+  "37": { inputs: { aspect_ratio: "1:1 (Square)", megapixels: 2, multiple: 8 }, class_type: "ResolutionSelector", _meta: { title: "Resolution Selector" } },
   "98:9": { inputs: { vae_name: "flux2-vae.safetensors" }, class_type: "VAELoader", _meta: { title: "Load VAE" } },
   "98:10": { inputs: { conditioning: ["98:24", 0] }, class_type: "ConditioningZeroOut", _meta: { title: "ConditioningZeroOut" } },
   "98:11": { inputs: { width: ["98:31", 1], height: ["98:32", 1], batch_size: 1 }, class_type: "EmptyFlux2LatentImage", _meta: { title: "Empty Flux 2 Latent" } },

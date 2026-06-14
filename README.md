@@ -305,6 +305,10 @@ Then in the editor, tick **"Connect directly to ComfyUI"** and enter its URL (e.
 
 The **Test connection** button in the ComfyUI panel pings `/system_stats` and reports whether the server is reachable (and its ComfyUI version), or explains what's wrong (down / wrong URL / CORS-blocked).
 
+### Render fails with "Prompt outputs failed validation — Required input is missing"
+
+This means the installed ComfyUI has a node that requires an input the bundled workflow doesn't supply — most often after a ComfyUI update adds a new required field to a stock node (e.g. `ResolutionSelector` gained a `multiple` input). The editor tries to self-heal: before each render it reconciles the workflow against the server's `/object_info` and fills any newly-required input from its declared default. If that error still appears, a **hard refresh** of the editor (so it re-fetches `/object_info` instead of using a tab opened before the update) usually clears it. Inputs that can't be auto-filled (e.g. ones with no default) need the workflow template in [`llmcore.js`](llmcore.js) updated to match the new node.
+
 ## Files
 
 | File | Purpose |
