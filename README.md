@@ -11,7 +11,7 @@ Everything lives in [`index.html`](index.html) (HTML + CSS + vanilla JS, no depe
 ## Features
 
 - **Tiled, draggable workspace** — the main area is a GridStack grid of resizable/draggable windows (Prompt builder, Layout canvas, JSON output, Rendered output). Drag a window by its title bar, resize from the edges; the arrangement is saved per browser. A header picker offers space-maximizing presets — *Sidebar + split* (builder sidebar, canvas + render side by side, JSON strip below), *Three columns*, *Render focus*, and *Quadrants*. GridStack is bundled locally (no CDN), served by the proxy.
-- **Visual layout canvas** — drag/resize bounding boxes on a 1000×1000 grid (origin top-left). Each box is an element with a type, description, and color palette. The canvas reshapes to the selected aspect ratio.
+- **Visual layout canvas** — drag/resize bounding boxes on a 1000×1000 grid (origin top-left). Each box is an element with a type, description, and color palette. Select several at once by **dragging a marquee on empty canvas** or **Ctrl/⌘-clicking** boxes, then drag any one to move the whole group; **Shift/Alt-click** (or double-click) a box to edit its text inline. The canvas reshapes to the selected aspect ratio, and your working layout is **saved per browser** so it survives a reload.
 - **Structured prompt builder** — high-level description, style block (aesthetics, lighting, photo, medium, palette), background, and a reorderable list of elements.
 - **Preset color palettes** — a **🎨 Preset palettes** picker in the Style block opens ~30 curated, colorhunt-style 4-colour sets. Pick one and choose where it lands — just the image's style palette, or the whole image (which also clears per-element colours). Individual swatches stay editable afterwards.
 - **Font-style picker** — `text` and `logo` elements get a typography picker: choose a preset style (each previewed in a matching, self-hosted web font — works fully offline) or type your own descriptor. The chosen style is injected into that element's prompt as a `font` field and round-trips through save/load and LLM refine.
@@ -25,7 +25,7 @@ Everything lives in [`index.html`](index.html) (HTML + CSS + vanilla JS, no depe
 - **RTX Super Resolution** — optionally upscale the render with NVIDIA's `RTXVideoSuperResolution` node before preview/save: tick **RTX Super Resolution** in the ComfyUI parameters, choose a quality preset (LOW–ULTRA) and a 1–4× scale. Spliced in on the fly like the LoRA; needs the `comfyui_nvidia_rtx_nodes` pack and an RTX GPU on the server.
 - **GPU monitor** — live GPU-utilization and VRAM graphs in the top bar (ComfyUI mode), fed by the [Crystools](https://github.com/crystian/ComfyUI-Crystools) websocket; falls back to a VRAM-only graph if Crystools isn't installed.
 - **LLMCam (mobile)** — a phone-first companion page ([`llmcam.html`](llmcam.html)): take a photo and re-render it through Ideogram keeping the composition, with one-tap transforms (faithful, time travel, art style, genre/mood) and Save/Share. See [below](#llmcam-mobile-camera-app).
-- **Import / Reset / Download** — round-trip the prompt JSON.
+- **Import / Reset / Download** — round-trip the prompt JSON. Download also embeds (under an `_editor` key) the reference/compare image and the render currently shown behind the layout, so re-importing the file restores those images too; importing a layout that carries none clears any stale image left over from the previous one.
 
 ## Quick start
 
@@ -57,6 +57,8 @@ A toggle in the header switches between:
 ```
 
 Coordinates are a 1000×1000 space, origin top-left, `bbox = [x1, y1, x2, y2]`. `font` is optional and only carried for `text`/`logo` elements (a typography descriptor like *"bold geometric sans-serif lettering"*); it's omitted everywhere else.
+
+A **downloaded** file additionally carries a `canvas` block (output pixel size / aspect, used to restore the frame on import) and an optional `_editor` block (the reference/compare image and backdrop render). Both are editor round-trip metadata — they're ignored by the model and never appear in the copied prompt or the prompt text sent to ComfyUI.
 
 ## Settings (⚙)
 
@@ -325,5 +327,5 @@ This means the installed ComfyUI has a node that requires an input the bundled w
 ## Notes
 
 - Rendered images come back as ComfyUI `temp` files (from the `PreviewImage` node); the editor handles that automatically.
-- LLM and ComfyUI settings persist in `localStorage` (per browser).
+- LLM and ComfyUI settings persist in `localStorage` (per browser). The working layout (description, style, background, elements) is autosaved there too and restored on reload; the last render is re-shown behind the layout as the backdrop.
 - Works over plain HTTP on a LAN; clipboard copy falls back to a manual path on insecure origins.

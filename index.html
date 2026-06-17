@@ -250,6 +250,7 @@
   .handle { position: absolute; width: 11px; height: 11px; background: #fff; border: 1.5px solid var(--accent); border-radius: 3px; }
   .handle.se { right: -6px; bottom: -6px; cursor: nwse-resize; }
   .box, .handle { touch-action: none; }
+  .marquee { position: absolute; border: 1px solid rgba(255,255,255,.7); background: rgba(99,102,241,.18); pointer-events: none; z-index: 60; border-radius: 2px; }
   .grid-line { position: absolute; background: rgba(255,255,255,.05); }
   .toggle { display: flex; align-items: center; gap: 7px; margin: 0; color: var(--muted); font-size: 12px; cursor: pointer; }
   .toggle input { width: auto; accent-color: var(--accent); }
@@ -399,6 +400,8 @@
   .tile-body { flex: 1; overflow: auto; padding: 14px; min-height: 0; }
   .tile-body.canvas-body { display: flex; flex-direction: column; align-items: stretch; gap: 8px; padding: 10px; }
   .canvas-area { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
+  .canvas-hint { flex: 0 0 auto; text-align: center; font-size: 10.5px; color: var(--faint); line-height: 1.35; padding: 0 6px; }
+  .canvas-hint b { color: var(--muted); font-weight: 600; }
   .tile-bar-controls { margin-left: auto; display: flex; align-items: center; gap: 12px; cursor: default; }
   .tile-bar-controls .toggle { margin: 0; font-size: 11px; }
   .tile-body.json-body { display: flex; flex-direction: column; gap: 12px; }
@@ -432,8 +435,8 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.64 3.64-1.28-1.28a1.21 1.21 0 0 0-1.72 0L2.36 18.64a1.21 1.21 0 0 0 0 1.72l1.28 1.28a1.2 1.2 0 0 0 1.72 0L21.64 5.36a1.2 1.2 0 0 0 0-1.72Z"/><path d="m14 7 3 3"/><path d="M5 6v4"/><path d="M19 14v4"/><path d="M10 2v2"/><path d="M7 8H3"/><path d="M21 16h-4"/><path d="M11 3H9"/></svg>
         <span>Refine</span>
       </button>
-      <button id="importBtn" title="Import JSON" aria-label="Import">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m8 11 4 4 4-4"/><path d="M8 5H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-4"/></svg>
+      <button id="importBtn" title="Import JSON from a file" aria-label="Import">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 14 1.45-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>
       </button>
       <button id="resetBtn" title="Reset to the default example" aria-label="Reset">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
@@ -727,6 +730,7 @@
       </div>
       <div class="tile-body canvas-body">
         <div class="canvas-area" id="canvasArea"><div class="canvas-wrap" id="canvasWrap"><img id="backdropImg" alt=""><div id="stage"></div></div></div>
+        <div class="canvas-hint">Drag empty space or <b>Ctrl/⌘-click</b> to multi-select · <b>Shift/Alt-click</b> to edit text</div>
       </div>
     </div>
   </div>
@@ -1054,6 +1058,48 @@ function defaultState() {
 
 let state = defaultState();
 let selectedId = null;
+// Multi-selection on the layout canvas (Ctrl/Cmd-click to toggle, or marquee-
+// drag on empty canvas). selectedId stays the "primary"/last-touched element
+// used by the element list + inline edit; selectedIds drives group drag and the
+// canvas highlight. A single click collapses selectedIds back to one element.
+let selectedIds = new Set();
+
+// ---- Persist the working layout across reloads ----------------------------
+// The render gallery and saved setups already persist; the layout being edited
+// did not, so a reload dropped back to the default example. Autosave `state`
+// (debounced) and restore it on boot.
+const STATE_KEY = "ideogram_editor_state";
+let _stateSaveT = null;
+function scheduleSaveState() {
+  if (_stateSaveT) return;
+  _stateSaveT = setTimeout(() => {
+    _stateSaveT = null;
+    try { localStorage.setItem(STATE_KEY, JSON.stringify(state)); } catch (_) {}
+  }, 400);
+}
+function loadEditorState() {
+  let s;
+  try { s = JSON.parse(localStorage.getItem(STATE_KEY) || "null"); } catch (_) { return null; }
+  if (!s || typeof s !== "object" || !Array.isArray(s.elements)) return null;
+  const sd = s.style_description || {};
+  // Re-hydrate through emptyElement so missing fields get defaults and each
+  // element gets a fresh unique _id (keeps the uid counter consistent).
+  return {
+    high_level_description: s.high_level_description || "",
+    style_description: {
+      aesthetics: sd.aesthetics || "", lighting: sd.lighting || "",
+      photo: sd.photo || "", medium: sd.medium || "",
+      color_palette: Array.isArray(sd.color_palette) ? sd.color_palette.slice() : []
+    },
+    background: s.background || "",
+    elements: s.elements.map(e => emptyElement({
+      type: e.type,
+      bbox: Array.isArray(e.bbox) && e.bbox.length === 4 ? e.bbox.slice() : undefined,
+      desc: e.desc, font: e.font, color_palette: e.color_palette,
+      vectorize: e.vectorize, enabled: e.enabled, _collapsed: e._collapsed
+    }))
+  };
+}
 
 const BOX_COLORS = ["#6366F1", "#F43F5E", "#34D399", "#F59E0B", "#A855F7", "#06B6D4", "#84CC16", "#EC4899", "#3B82F6", "#F97316"];
 function boxColor(i) { return BOX_COLORS[i % BOX_COLORS.length]; }
@@ -1406,7 +1452,8 @@ function renderCanvas() {
     const left = Math.min(x1, x2), top = Math.min(y1, y2);
     const w = Math.abs(x2 - x1), h = Math.abs(y2 - y1);
     const box = document.createElement("div");
-    box.className = "box" + (el._id === selectedId ? " selected" : "") + (el.enabled === false ? " disabled" : "");
+    box.className = "box" + ((el._id === selectedId || selectedIds.has(el._id)) ? " selected" : "") + (el.enabled === false ? " disabled" : "");
+    box.dataset.elId = el._id;
     box.style.left = (left / COORD * 100) + "%";
     box.style.top = (top / COORD * 100) + "%";
     box.style.width = (w / COORD * 100) + "%";
@@ -1436,6 +1483,14 @@ function renderCanvas() {
     box.addEventListener("pointerdown", (e) => {
       e.stopPropagation();
       if (box.classList.contains("editing")) return;   // let the caret land in the text
+      // Ctrl/Cmd-click toggles this box in/out of the multi-selection (no drag).
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        if (selectedIds.has(el._id)) { selectedIds.delete(el._id); if (selectedId === el._id) selectedId = null; }
+        else { selectedIds.add(el._id); selectedId = el._id; }
+        renderCanvas(); renderElements();
+        return;
+      }
       // Deterministic single-press trigger: Shift- or Alt-click edits the text.
       // (Double-click also works, but is timing/pointer-capture sensitive.)
       if (e.shiftKey || e.altKey) { e.preventDefault(); beginInlineEdit(el, box); return; }
@@ -1531,17 +1586,49 @@ function beginInlineEdit(el, box) {
   });
 }
 
+// Position a box DOM node from its 0..1000 bbox (used during drag so we can move
+// boxes in place without a full stage rebuild).
+function positionBox(boxEl, bbox) {
+  const left = Math.min(bbox[0], bbox[2]), top = Math.min(bbox[1], bbox[3]);
+  const bw = Math.abs(bbox[2] - bbox[0]), bh = Math.abs(bbox[3] - bbox[1]);
+  boxEl.style.left = (left / COORD * 100) + "%";
+  boxEl.style.top = (top / COORD * 100) + "%";
+  boxEl.style.width = (bw / COORD * 100) + "%";
+  boxEl.style.height = (bh / COORD * 100) + "%";
+}
+
 let drag = null;
 function startDrag(e, el, mode, boxEl) {
   e.preventDefault();
+  const stage = $("stage");
+  // Dragging a box that's already part of a multi-selection moves the whole
+  // group; any other press collapses the selection to just this box.
+  const groupMove = mode === "move" && selectedIds.has(el._id) && selectedIds.size > 1;
+  if (!groupMove) selectedIds = new Set([el._id]);
+  selectedId = el._id;
   // Select WITHOUT rebuilding the stage — a full renderCanvas() here would
   // detach boxEl before pointer capture / move listeners attach to it.
-  selectedId = el._id;
-  document.querySelectorAll("#stage .box.selected").forEach(b => b.classList.remove("selected"));
-  boxEl.classList.add("selected");
+  stage.querySelectorAll(".box.selected").forEach(b => { if (!selectedIds.has(+b.dataset.elId)) b.classList.remove("selected"); });
+  selectedIds.forEach(id => { const b = stage.querySelector('.box[data-el-id="' + id + '"]'); if (b) b.classList.add("selected"); });
   renderElements();
-  const rect = $("stage").getBoundingClientRect();
-  drag = { el, mode, rect, startX: e.clientX, startY: e.clientY, orig: el.bbox.slice(), boxEl, pointerId: e.pointerId };
+  const rect = stage.getBoundingClientRect();
+  // Items moved by this gesture: the whole selection for a group move, else just
+  // this box. Each keeps its starting bbox so deltas apply from a fixed origin.
+  const ids = groupMove ? [...selectedIds] : [el._id];
+  const items = ids.map(id => {
+    const e2 = state.elements.find(x => x._id === id);
+    const b2 = stage.querySelector('.box[data-el-id="' + id + '"]');
+    return (e2 && b2) ? { el: e2, orig: e2.bbox.slice(), boxEl: b2 } : null;
+  }).filter(Boolean);
+  // Group bounds (from each box's min/max corner) so a move can be clamped to
+  // keep every box on the canvas without distorting their relative spacing.
+  let gMinX = COORD, gMinY = COORD, gMaxX = 0, gMaxY = 0;
+  items.forEach(it => {
+    const [a, b, c, d] = it.orig;
+    gMinX = Math.min(gMinX, a, c); gMaxX = Math.max(gMaxX, a, c);
+    gMinY = Math.min(gMinY, b, d); gMaxY = Math.max(gMaxY, b, d);
+  });
+  drag = { el, mode, rect, startX: e.clientX, startY: e.clientY, boxEl, pointerId: e.pointerId, items, gMinX, gMinY, gMaxX, gMaxY, wasGroup: groupMove };
   // Capture the pointer so move/up always reach us (even off-element / fast drags),
   // and so GridStack can't hijack the gesture.
   try { boxEl.setPointerCapture(e.pointerId); } catch (_) {}
@@ -1552,7 +1639,7 @@ function startDrag(e, el, mode, boxEl) {
 
 function onDrag(e) {
   if (!drag) return;
-  const { el, mode, rect, orig, boxEl } = drag;
+  const { mode, rect, items } = drag;
   // Ignore sub-threshold jitter: a click (or the small wobble during a
   // double-click) must not nudge the box or count as a drag — moving would
   // rebuild the stage and reset the double-click detector below.
@@ -1560,35 +1647,34 @@ function onDrag(e) {
     if (Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) < 4) return;
     drag.active = true;
   }
-  const dx = (e.clientX - drag.startX) / rect.width * COORD;
-  const dy = (e.clientY - drag.startY) / rect.height * COORD;
-  let [x1, y1, x2, y2] = orig;
-  let nx1 = Math.min(x1, x2), nx2 = Math.max(x1, x2);
-  let ny1 = Math.min(y1, y2), ny2 = Math.max(y1, y2);
-  if (mode === "move") {
-    const w = nx2 - nx1, h = ny2 - ny1;
-    nx1 = clamp(nx1 + dx, 0, COORD - w); ny1 = clamp(ny1 + dy, 0, COORD - h);
-    nx2 = nx1 + w; ny2 = ny1 + h;
-  } else {
-    nx2 = clamp(nx2 + dx, nx1 + 5, COORD); ny2 = clamp(ny2 + dy, ny1 + 5, COORD);
-  }
-  el.bbox = [Math.round(nx1), Math.round(ny1), Math.round(nx2), Math.round(ny2)];
-  // Update only the dragged box in place — rebuilding the whole stage mid-drag
+  let dx = (e.clientX - drag.startX) / rect.width * COORD;
+  let dy = (e.clientY - drag.startY) / rect.height * COORD;
+  // Update only the affected boxes in place — rebuilding the whole stage mid-drag
   // destroys the element we're dragging.
-  if (boxEl) {
-    const left = Math.min(el.bbox[0], el.bbox[2]), top = Math.min(el.bbox[1], el.bbox[3]);
-    const bw = Math.abs(el.bbox[2] - el.bbox[0]), bh = Math.abs(el.bbox[3] - el.bbox[1]);
-    boxEl.style.left = (left / COORD * 100) + "%";
-    boxEl.style.top = (top / COORD * 100) + "%";
-    boxEl.style.width = (bw / COORD * 100) + "%";
-    boxEl.style.height = (bh / COORD * 100) + "%";
+  if (mode === "move") {
+    // One shared delta, clamped so the whole group stays on the canvas.
+    dx = clamp(dx, -drag.gMinX, COORD - drag.gMaxX);
+    dy = clamp(dy, -drag.gMinY, COORD - drag.gMaxY);
+    items.forEach(it => {
+      const [x1, y1, x2, y2] = it.orig;
+      const nx1 = Math.min(x1, x2), ny1 = Math.min(y1, y2), nx2 = Math.max(x1, x2), ny2 = Math.max(y1, y2);
+      it.el.bbox = [Math.round(nx1 + dx), Math.round(ny1 + dy), Math.round(nx2 + dx), Math.round(ny2 + dy)];
+      positionBox(it.boxEl, it.el.bbox); syncBboxInputs(it.el);
+    });
+  } else {
+    const it = items[0];
+    const [x1, y1, x2, y2] = it.orig;
+    const nx1 = Math.min(x1, x2), ny1 = Math.min(y1, y2);
+    const nx2 = clamp(Math.max(x1, x2) + dx, nx1 + 5, COORD), ny2 = clamp(Math.max(y1, y2) + dy, ny1 + 5, COORD);
+    it.el.bbox = [Math.round(nx1), Math.round(ny1), Math.round(nx2), Math.round(ny2)];
+    positionBox(it.boxEl, it.el.bbox); syncBboxInputs(it.el);
   }
-  renderJSONThrottled(); syncBboxInputs(el);
+  renderJSONThrottled();
 }
 
 function endDrag() {
   if (!drag) return;
-  const { boxEl, pointerId, active } = drag;
+  const { el, boxEl, pointerId, active, wasGroup } = drag;
   drag = null;
   if (boxEl) {
     try { boxEl.releasePointerCapture(pointerId); } catch (_) {}
@@ -1601,6 +1687,8 @@ function endDrag() {
   // double-click detector. Selection is already applied in startDrag, so a
   // no-move click needs no redraw.
   if (active) { lastBoxDown = { id: null, at: 0 }; renderCanvas(); renderJSON(); renderElements(); }
+  // A plain click on a box inside a multi-selection collapses to just that box.
+  else if (wasGroup) { selectedIds = new Set([el._id]); selectedId = el._id; renderCanvas(); renderElements(); }
 }
 
 function syncBboxInputs(el) {
@@ -1611,7 +1699,7 @@ function syncBboxInputs(el) {
   if (inputs.length === 4) el.bbox.forEach((v, k) => { if (document.activeElement !== inputs[k]) inputs[k].value = v; });
 }
 
-function selectElement(id) { selectedId = id; renderCanvas(); renderElements(); }
+function selectElement(id) { selectedId = id; selectedIds = new Set([id]); renderCanvas(); renderElements(); }
 
 /* ------------------------------------------------------------------ */
 /*  JSON                                                              */
@@ -1658,7 +1746,7 @@ function renderJSONThrottled() {
   jsonThrottle = requestAnimationFrame(() => { jsonThrottle = null; renderJSON(); });
 }
 
-function renderJSON() { $("json").innerHTML = highlight(JSON.stringify(buildJSON(), null, 2)); }
+function renderJSON() { $("json").innerHTML = highlight(JSON.stringify(buildJSON(), null, 2)); scheduleSaveState(); }
 
 function highlight(json) {
   return escapeHtml(json).replace(/("(\\.|[^"\\])*")(\s*:)?|\b(-?\d+\.?\d*)\b|([{}\[\],])/g,
@@ -1684,6 +1772,7 @@ function addElement() {
 function removeElement(id) {
   state.elements = state.elements.filter(e => e._id !== id);
   if (selectedId === id) selectedId = null;
+  selectedIds.delete(id);
   render();
 }
 
@@ -1711,8 +1800,44 @@ async function copyText(text) {
   } catch (_) { return false; }
 }
 
+// Editor-only side data attached to a downloaded layout (under "_editor") so
+// re-importing the file restores the images too — the reference/compare image
+// and the render shown behind the layout. Kept out of buildJSON()/buildPromptObj()
+// so it never leaks into the diffusion prompt; only the download carries it.
+function collectEditorRefs() {
+  const ed = {};
+  // Reference/compare image — prefer the small proxy cache key, else inline it.
+  if (sourceImageRef) ed.sourceImageRef = sourceImageRef;
+  else if (sourceImageDataUrl) ed.sourceImage = sourceImageDataUrl;
+  // The render currently shown behind the layout (the "background image").
+  if (previewRenderRef && previewRenderRef.filename) {
+    const idx = historyIndexOf(previewRenderRef);
+    const it = idx >= 0 ? renderHistory[idx] : null;
+    ed.render = { filename: previewRenderRef.filename, subfolder: previewRenderRef.subfolder || "",
+                  type: (it && it.type) || "output", rotation: (it && it.rotation) || 0 };
+  }
+  return Object.keys(ed).length ? ed : null;
+}
+// Restore the images embedded in an imported file (see collectEditorRefs).
+function restoreEditorRefs(ed) {
+  ed = ed || {};
+  if (ed.sourceImageRef) { sourceImageRef = ed.sourceImageRef; sourceImageDataUrl = null; }
+  else if (ed.sourceImage) {
+    sourceImageDataUrl = ed.sourceImage; sourceImageRef = null;
+    uploadRefImage(sourceImageDataUrl).then(k => { sourceImageRef = k; }).catch(() => {});   // re-cache for the compare slider
+  } else { sourceImageDataUrl = null; sourceImageRef = null; }
+  // Bring the layout backdrop back. Works when the same ComfyUI still has the
+  // file; showRenderInPreview hides gracefully otherwise (e.g. another machine).
+  // When the import carries no render, clear any stale backdrop so the old image
+  // doesn't linger behind the new layout.
+  showRenderInPreview(ed.render && ed.render.filename ? ed.render : null);
+}
+
 function doDownload() {
-  const blob = new Blob([JSON.stringify(buildJSON(), null, 2)], { type: "application/json" });
+  const obj = buildJSON();
+  const ed = collectEditorRefs();
+  if (ed) obj._editor = ed;
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "ideogram-prompt.json";
@@ -1724,7 +1849,7 @@ function doDownload() {
 function doImport(file) {
   const reader = new FileReader();
   reader.onload = () => {
-    try { loadFromJSON(JSON.parse(reader.result)); sourceImageDataUrl = null; sourceImageRef = null; toast("Imported ✓", "ok"); }
+    try { const data = JSON.parse(reader.result); loadFromJSON(data); restoreEditorRefs(data._editor); toast("Imported ✓", "ok"); }
     catch (err) { toast("Invalid JSON: " + err.message, "bad"); }
   };
   reader.readAsText(file);
@@ -1738,12 +1863,29 @@ function scaleBoxFromPixels(b, w, h) {
 function loadFromJSON(data) {
   const sd = data.style_description || {};
   const cd = data.compositional_deconstruction || {};
-  // If the JSON carries a pixel-space canvas (our download/diffusion shape),
-  // map bboxes back into the editor's 0..1000 space. LLM/external JSON has no
-  // canvas, so srcW/srcH default to COORD and this is a no-op.
+  const srcEls = Array.isArray(cd.elements) ? cd.elements : [];
+  // Two JSON shapes can land here:
+  //  • Our download / diffusion shape — carries a `canvas` block and stores
+  //    bboxes Y-first ([ymin,xmin,ymax,xmax]), normally on the 0..1000 grid
+  //    (very old exports scaled them to pixels). Decode = transpose to X-first,
+  //    and only divide by the canvas size if the values are actually in pixels.
+  //  • External / LLM JSON — no canvas, bboxes already X-first 0..1000.
   const cv = data.canvas || {};
+  const hasCanvas = (+cv.width > 0 && +cv.height > 0) || !!cv.aspect_ratio || !!cv.orientation;
   const srcW = (+cv.width > 0) ? +cv.width : COORD;
   const srcH = (+cv.height > 0) ? +cv.height : COORD;
+  // Pixel-space only if some coordinate exceeds the normalized 0..1000 range.
+  const maxCoord = Math.max(0, ...srcEls.flatMap(e => Array.isArray(e.bbox) ? e.bbox.map(n => +n || 0) : []));
+  const pixelSpace = maxCoord > COORD;
+  const clampBox = b => b.map(v => clamp(Math.round(+v || 0), 0, COORD));
+  const decodeBbox = (b) => {
+    if (!Array.isArray(b) || b.length !== 4) return [100, 100, 500, 500];
+    if (hasCanvas) {
+      const xf = [b[1], b[0], b[3], b[2]];   // Y-first → editor X-first
+      return pixelSpace ? scaleBoxFromPixels(xf, srcW, srcH) : clampBox(xf);
+    }
+    return pixelSpace ? scaleBoxFromPixels(b, srcW, srcH) : clampBox(b);
+  };
   state = {
     high_level_description: data.high_level_description || "",
     style_description: {
@@ -1752,17 +1894,27 @@ function loadFromJSON(data) {
       color_palette: Array.isArray(sd.color_palette) ? sd.color_palette.map(normalizeUpper) : []
     },
     background: cd.background || "",
-    elements: Array.isArray(cd.elements) ? cd.elements.map(e => emptyElement({
+    elements: srcEls.map(e => emptyElement({
       type: e.type || "obj",
-      bbox: Array.isArray(e.bbox) && e.bbox.length === 4 ? scaleBoxFromPixels(e.bbox, srcW, srcH) : [100, 100, 500, 500],
+      bbox: decodeBbox(e.bbox),
       desc: e.desc || "",
       font: e.font || "",
       color_palette: Array.isArray(e.color_palette) ? e.color_palette.map(normalizeUpper) : [],
       enabled: e.enabled
-    })) : []
+    }))
   };
   selectedId = null;
+  selectedIds.clear();
+  // Reshape the preview frame (and the next render) to the imported canvas so
+  // the boxes sit in the aspect ratio they were authored for.
+  if (hasCanvas) {
+    const ar = (+cv.width > 0 && +cv.height > 0) ? (+cv.width / +cv.height) : parseAspectRatio(cv.aspect_ratio || "1:1");
+    comfyCfg.aspect_ratio = nearestAspect(ar);
+    if ($("cf-aspect")) $("cf-aspect").value = comfyCfg.aspect_ratio;
+    saveComfyCfg();
+  }
   render();
+  applyCanvasAspect();
 }
 
 function normalizeUpper(c) { return typeof c === "string" ? c.toUpperCase() : "#FFFFFF"; }
@@ -2249,7 +2401,7 @@ $("copyBtn").addEventListener("click", doCopy);
 $("copyBtn2").addEventListener("click", doCopy);
 $("downloadBtn").addEventListener("click", doDownload);
 $("downloadBtn2").addEventListener("click", doDownload);
-$("resetBtn").addEventListener("click", () => { if (confirm("Reset to the default example? Current work will be lost.")) { state = defaultState(); selectedId = null; sourceImageDataUrl = null; sourceImageRef = null; render(); } });
+$("resetBtn").addEventListener("click", () => { if (confirm("Reset to the default example? Current work will be lost.")) { state = defaultState(); selectedId = null; selectedIds.clear(); sourceImageDataUrl = null; sourceImageRef = null; render(); } });
 $("importBtn").addEventListener("click", () => $("fileInput").click());
 $("fileInput").addEventListener("change", e => { if (e.target.files[0]) doImport(e.target.files[0]); e.target.value = ""; });
 $("gridToggle").addEventListener("change", renderCanvas);
@@ -2262,8 +2414,68 @@ document.querySelectorAll("[data-collapsible] .panel-head").forEach(h => {
   h.addEventListener("click", () => h.closest(".panel").classList.toggle("collapsed"));
 });
 
-// deselect on stage background click
-$("stage").addEventListener("click", () => { selectedId = null; renderCanvas(); renderElements(); });
+// deselect on stage background click — but not the click that ends a marquee
+// drag (that already set the selection and must not be wiped).
+let marqueeJustFinished = false;
+$("stage").addEventListener("click", () => {
+  if (marqueeJustFinished) { marqueeJustFinished = false; return; }
+  selectedId = null; selectedIds.clear(); renderCanvas(); renderElements();
+});
+
+// Marquee (rubber-band) selection: drag on an empty part of the canvas to select
+// every box the rectangle touches. Ctrl/Cmd-drag adds to the current selection.
+// Box presses never reach here — boxes stopPropagation in their own pointerdown.
+let marquee = null;
+$("stage").addEventListener("pointerdown", (e) => {
+  if (drag || e.target.closest(".box")) return;   // a box drag owns this gesture
+  const stage = $("stage");
+  marquee = { rect: stage.getBoundingClientRect(), startX: e.clientX, startY: e.clientY,
+              additive: e.ctrlKey || e.metaKey, moved: false, el: null, pointerId: e.pointerId, cur: null };
+  try { stage.setPointerCapture(e.pointerId); } catch (_) {}
+  stage.addEventListener("pointermove", onMarquee);
+  stage.addEventListener("pointerup", endMarquee);
+  stage.addEventListener("pointercancel", endMarquee);
+});
+function onMarquee(e) {
+  if (!marquee) return;
+  if (!marquee.moved) {
+    if (Math.hypot(e.clientX - marquee.startX, e.clientY - marquee.startY) < 4) return;
+    marquee.moved = true;
+    marquee.el = document.createElement("div");
+    marquee.el.className = "marquee";
+    $("stage").appendChild(marquee.el);
+  }
+  const r = marquee.rect;
+  const x1 = Math.min(marquee.startX, e.clientX), x2 = Math.max(marquee.startX, e.clientX);
+  const y1 = Math.min(marquee.startY, e.clientY), y2 = Math.max(marquee.startY, e.clientY);
+  marquee.cur = { x1, y1, x2, y2 };
+  marquee.el.style.left = (x1 - r.left) + "px";
+  marquee.el.style.top = (y1 - r.top) + "px";
+  marquee.el.style.width = (x2 - x1) + "px";
+  marquee.el.style.height = (y2 - y1) + "px";
+}
+function endMarquee(e) {
+  if (!marquee) return;
+  const m = marquee; marquee = null;
+  const stage = $("stage");
+  try { stage.releasePointerCapture(m.pointerId); } catch (_) {}
+  stage.removeEventListener("pointermove", onMarquee);
+  stage.removeEventListener("pointerup", endMarquee);
+  stage.removeEventListener("pointercancel", endMarquee);
+  if (m.el) m.el.remove();
+  if (!m.moved || !m.cur) return;   // a plain click — let the deselect handler run
+  marqueeJustFinished = true;       // suppress the click that follows pointerup
+  if (!m.additive) selectedIds.clear();
+  const s = m.cur;
+  state.elements.forEach(el => {
+    const b = stage.querySelector('.box[data-el-id="' + el._id + '"]');
+    if (!b) return;
+    const r = b.getBoundingClientRect();
+    if (!(r.right < s.x1 || r.left > s.x2 || r.bottom < s.y1 || r.top > s.y2)) selectedIds.add(el._id);
+  });
+  selectedId = selectedIds.size ? [...selectedIds][selectedIds.size - 1] : null;
+  renderCanvas(); renderElements();
+}
 
 // generate modal
 $("generateBtn").addEventListener("click", openGenModal);
@@ -3048,6 +3260,10 @@ async function bootstrapStore() {
   storeReady = true;
   refreshSetupList();
   renderGallery();
+  // Restore the inline render preview to the most recent render so a reload also
+  // brings back the layout backdrop (the image shown behind the boxes), matching
+  // the now-persisted layout. No-op when there's no history or no ComfyUI base.
+  if (renderHistory.length) { viewerIndex = renderHistory.length - 1; showRenderInPreview(renderHistory[viewerIndex]); }
 }
 // One-time copy of any localStorage gallery/setups into a fresh (empty) DB, so
 // existing users keep their data on first run against the new backend.
@@ -3495,7 +3711,7 @@ function applySetup(s, beforeImage, beforeRef) {
     })) : []
   };
   if (s.comfy) SETUP_COMFY_KEYS.forEach(k => { if (k in s.comfy) comfyCfg[k] = s.comfy[k]; });
-  selectedId = null;
+  selectedId = null; selectedIds.clear();
   sourceImageDataUrl = beforeImage || s.sourceImage || null;   // restore the reference image (compare slider, and so re-renders keep it)
   sourceImageRef = beforeRef || s.sourceImageRef || null;
   setGenContextFromSetup(s, beforeImage);   // so a queue "regenerate prompt" rebuilds THIS setup (not the live Generate-modal fields)
@@ -4132,6 +4348,8 @@ updateComfyTarget();
 renderGallery();        // empty first paint; bootstrapStore() fills the gallery + setups once storage loads
 bootstrapStore();
 applyMode();
+const _savedState = loadEditorState();   // restore the working layout from the last session (if any)
+if (_savedState) { state = _savedState; selectedId = null; selectedIds.clear(); }
 render();
 applyCanvasAspect();
 if (comfyCfg.mode === "comfy" && comfyBase()) populateLoraList();
