@@ -1101,6 +1101,22 @@ function loadEditorState() {
   };
 }
 
+// The render shown behind the layout (backdrop) is persisted separately so a
+// reload restores the image that goes WITH the restored layout — not whatever
+// the globally-latest render happens to be. Written whenever the inline preview
+// changes (see savePreviewRef call sites); null means "no backdrop".
+const PREVIEW_KEY = "ideogram_preview_render";
+function savePreviewRef() {
+  try {
+    if (previewRenderRef && previewRenderRef.filename) localStorage.setItem(PREVIEW_KEY, JSON.stringify(previewRenderRef));
+    else localStorage.removeItem(PREVIEW_KEY);
+  } catch (_) {}
+}
+function loadPreviewRef() {
+  try { const r = JSON.parse(localStorage.getItem(PREVIEW_KEY) || "null"); return (r && r.filename) ? r : null; }
+  catch (_) { return null; }
+}
+
 const BOX_COLORS = ["#6366F1", "#F43F5E", "#34D399", "#F59E0B", "#A855F7", "#06B6D4", "#84CC16", "#EC4899", "#3B82F6", "#F97316"];
 function boxColor(i) { return BOX_COLORS[i % BOX_COLORS.length]; }
 
@@ -2401,7 +2417,7 @@ $("copyBtn").addEventListener("click", doCopy);
 $("copyBtn2").addEventListener("click", doCopy);
 $("downloadBtn").addEventListener("click", doDownload);
 $("downloadBtn2").addEventListener("click", doDownload);
-$("resetBtn").addEventListener("click", () => { if (confirm("Reset to the default example? Current work will be lost.")) { state = defaultState(); selectedId = null; selectedIds.clear(); sourceImageDataUrl = null; sourceImageRef = null; render(); } });
+$("resetBtn").addEventListener("click", () => { if (confirm("Reset to the default example? Current work will be lost.")) { state = defaultState(); selectedId = null; selectedIds.clear(); sourceImageDataUrl = null; sourceImageRef = null; showRenderInPreview(null); render(); } });
 $("importBtn").addEventListener("click", () => $("fileInput").click());
 $("fileInput").addEventListener("change", e => { if (e.target.files[0]) doImport(e.target.files[0]); e.target.value = ""; });
 $("gridToggle").addEventListener("change", renderCanvas);
@@ -3097,6 +3113,7 @@ async function showResult(base, promptId) {
   el.onerror = () => setRenderStatus("Image rendered but could not be loaded from " + comfyBase() + "/view", "err");
   el.src = viewUrl(entry);
   previewRenderRef = { filename: entry.filename, subfolder: entry.subfolder || "" };   // inline preview now shows this render
+  savePreviewRef();   // persist so a reload restores this render as the backdrop
   setRenderStatus("Done ✓ · seed " + comfyCfg.seed + (comfyCfg.save ? " · saved" : ""), "ok");
   toast("Render complete ✓", "ok");
   addRenderToHistory(entry);
@@ -3260,10 +3277,18 @@ async function bootstrapStore() {
   storeReady = true;
   refreshSetupList();
   renderGallery();
-  // Restore the inline render preview to the most recent render so a reload also
-  // brings back the layout backdrop (the image shown behind the boxes), matching
-  // the now-persisted layout. No-op when there's no history or no ComfyUI base.
-  if (renderHistory.length) { viewerIndex = renderHistory.length - 1; showRenderInPreview(renderHistory[viewerIndex]); }
+  // Restore the inline render preview to the render that was showing before the
+  // reload (persisted alongside the layout), so the backdrop matches the restored
+  // layout rather than the globally-latest render. Enrich with the history
+  // entry's rotation when we still have it; clear if there's nothing persisted.
+  const savedRef = loadPreviewRef();
+  if (savedRef) {
+    const idx = historyIndexOf(savedRef);
+    if (idx >= 0) viewerIndex = idx;
+    showRenderInPreview(idx >= 0 ? renderHistory[idx] : savedRef);
+  } else {
+    showRenderInPreview(null);
+  }
 }
 // One-time copy of any localStorage gallery/setups into a fresh (empty) DB, so
 // existing users keep their data on first run against the new backend.
@@ -3683,6 +3708,7 @@ function findRenderForSetup(s) {
 function showRenderInPreview(ref) {
   const el = $("renderImg");
   previewRenderRef = (ref && ref.filename) ? { filename: ref.filename, subfolder: ref.subfolder || "" } : null;
+  savePreviewRef();   // keep the persisted backdrop in step with what's shown
   if (!ref || !ref.filename || !comfyBase()) {
     el.style.display = "none"; el.removeAttribute("src");
     $("renderPlaceholder").style.display = "";

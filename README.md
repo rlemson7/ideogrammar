@@ -327,5 +327,5 @@ This means the installed ComfyUI has a node that requires an input the bundled w
 ## Notes
 
 - Rendered images come back as ComfyUI `temp` files (from the `PreviewImage` node); the editor handles that automatically.
-- LLM and ComfyUI settings persist in `localStorage` (per browser). The working layout (description, style, background, elements) is autosaved there too and restored on reload; the last render is re-shown behind the layout as the backdrop.
+- LLM and ComfyUI settings persist in `localStorage` (per browser). The working layout (description, style, background, elements) is autosaved there too and restored on reload, along with the render that was showing behind it (the backdrop) — so the image matches the restored layout rather than the globally-latest render. Reset to default clears both.
 - Works over plain HTTP on a LAN; clipboard copy falls back to a manual path on insecure origins.
