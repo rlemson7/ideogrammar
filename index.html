@@ -404,6 +404,7 @@
   .canvas-hint b { color: var(--muted); font-weight: 600; }
   .tile-bar-controls { margin-left: auto; display: flex; align-items: center; gap: 12px; cursor: default; }
   .tile-bar-controls .toggle { margin: 0; font-size: 11px; }
+  .bar-select { font-size: 11px; padding: 1px 4px; margin-left: 3px; background: var(--bg-2, #161b26); color: var(--text); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; }
   .tile-body.json-body { display: flex; flex-direction: column; gap: 12px; }
   .tile-body.json-body #json { flex: 1; max-height: none; margin: 0; }
   #outputManualNote { display: none; }
@@ -720,6 +721,7 @@
       <div class="tile-bar">
         <span class="tile-title">Layout preview</span>
         <div class="tile-bar-controls" id="canvasControls">
+          <label class="toggle" title="Output aspect ratio — reshapes the canvas and sets the JSON canvas block (also editable in ComfyUI settings)">AR <select id="canvasAspect" class="bar-select"></select></label>
           <label class="toggle"><input type="checkbox" id="gridToggle" checked> Grid</label>
           <label class="toggle"><input type="checkbox" id="labelToggle" checked> Labels</label>
           <span class="toggle comfy-only" id="backdropCtrls" style="gap:6px;">
@@ -2721,7 +2723,12 @@ document.addEventListener("visibilitychange", syncGpuMonitor);
 function applyCanvasAspect() {
   const wrap = $("canvasWrap");
   if (!wrap) return;
-  const ar = (comfyCfg.mode === "comfy") ? parseAspectRatio($("cf-aspect").value) : 1;
+  // Aspect ratio applies in BOTH modes: it reshapes this preview AND defines the
+  // canvas block in the exported JSON, so manual users need it too. Keep the
+  // ComfyUI-panel selector and the canvas-header selector mirrored.
+  if ($("cf-aspect")) $("cf-aspect").value = comfyCfg.aspect_ratio;
+  if ($("canvasAspect")) $("canvasAspect").value = comfyCfg.aspect_ratio;
+  const ar = parseAspectRatio(comfyCfg.aspect_ratio || "1:1 (Square)");
   const host = $("canvasArea") || wrap.parentElement; // flex-fill region
   const availW = Math.max(80, (host ? host.clientWidth : 560) - 2);
   const availH = Math.max(80, (host ? host.clientHeight : 560) - 2);
@@ -2730,6 +2737,32 @@ function applyCanvasAspect() {
   wrap.style.width = Math.round(w) + "px";
   wrap.style.height = Math.round(h) + "px";
   renderCanvas();
+}
+
+// Fill the canvas-header aspect selector with compact labels (just the ratio).
+function initCanvasAspect() {
+  const sel = $("canvasAspect"), src = $("cf-aspect");
+  if (!sel || !src || sel.options.length) return;
+  Array.from(src.options).forEach(opt => {
+    const o = document.createElement("option");
+    o.value = opt.value;
+    o.textContent = (opt.value.match(/^[^\s(]+/) || [opt.value])[0];   // "16:9 (Widescreen)" -> "16:9"
+    o.title = opt.value;
+    sel.appendChild(o);
+  });
+  sel.value = comfyCfg.aspect_ratio;
+}
+
+// Single entry point for an aspect-ratio change from either selector: update the
+// canonical value, mirror both selectors, persist, reshape, and refresh the JSON
+// (its canvas block depends on the aspect).
+function onAspectChange(val) {
+  comfyCfg.aspect_ratio = val;
+  if ($("cf-aspect")) $("cf-aspect").value = val;
+  if ($("canvasAspect")) $("canvasAspect").value = val;
+  saveComfyCfg();
+  applyCanvasAspect();
+  renderJSON();
 }
 
 /* ---- GridStack tiled window layout ---- */
@@ -4293,7 +4326,10 @@ $("cf-workflow").addEventListener("change", () => {
   saveComfyCfg();
   toast("Scheduler: " + (comfyCfg.workflow === "v2" ? "Simple (euler)" : "Ideogram 4 default"), "ok");
 });
-$("cf-aspect").addEventListener("change", applyCanvasAspect);
+// Both aspect selectors (ComfyUI panel + canvas header) route through one handler
+// so they stay in sync and the preview/JSON update in either mode.
+$("cf-aspect").addEventListener("change", () => onAspectChange($("cf-aspect").value));
+$("canvasAspect").addEventListener("change", () => onAspectChange($("canvasAspect").value));
 window.addEventListener("resize", applyCanvasAspect);
 $("layoutPreset").addEventListener("change", e => applyPreset(e.target.value));
 // keep the in-titlebar toggles clickable without starting a window drag
@@ -4360,7 +4396,9 @@ $("renderBtn").addEventListener("click", onRenderClick);
 $("renderBtn2").addEventListener("click", onRenderClick);
 $("renderCancel").addEventListener("click", cancelRender);
 $("cf-rerollSeed").addEventListener("click", () => { comfyCfg.seed = randomSeed(); $("cf-seed").value = comfyCfg.seed; saveComfyCfg(); });
-["cf-url", "cf-save", "cf-aspect", "cf-megapixels", "cf-preset", "cf-seed", "cf-randomize", "cf-cfg", "cf-sampler", "cf-cfgo", "cf-start", "cf-end", "cf-diff", "cf-uncond", "cf-lora-name", "cf-lora-strength", "cf-rtxsr-quality", "cf-rtxsr-scale", "cf-vae", "cf-clip", "cf-cliptype", "cf-batch", "cf-queue-count", "cf-queue-reseed", "cf-queue-regen", "cf-queue-guidance"].forEach(id => {
+// cf-aspect is handled by its own onAspectChange listener above (mirrors the
+// canvas-header selector), so it's intentionally omitted from this generic list.
+["cf-url", "cf-save", "cf-megapixels", "cf-preset", "cf-seed", "cf-randomize", "cf-cfg", "cf-sampler", "cf-cfgo", "cf-start", "cf-end", "cf-diff", "cf-uncond", "cf-lora-name", "cf-lora-strength", "cf-rtxsr-quality", "cf-rtxsr-scale", "cf-vae", "cf-clip", "cf-cliptype", "cf-batch", "cf-queue-count", "cf-queue-reseed", "cf-queue-regen", "cf-queue-guidance"].forEach(id => {
   const e = $(id); if (e) e.addEventListener("change", readComfyForm);
 });
 $("cf-lora-enabled").addEventListener("change", () => { readComfyForm(); syncLoraFields(); });
@@ -4369,6 +4407,7 @@ $("cf-rtxsr-enabled").addEventListener("change", () => { readComfyForm(); syncRt
 setupGrid();
 sanitizeComfyCfg();
 saveComfyCfg();
+initCanvasAspect();
 applyComfyForm();
 updateComfyTarget();
 renderGallery();        // empty first paint; bootstrapStore() fills the gallery + setups once storage loads
