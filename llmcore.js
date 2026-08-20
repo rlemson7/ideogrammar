@@ -116,10 +116,27 @@ IMAGE MODE: You are given an actual IMAGE (and possibly some extra text guidance
 
 /* ---- LLM call ---- */
 // POST to /chat/completions and return the message content. Some OpenAI-compatible
-// servers (e.g. LM Studio) reject response_format:{type:"json_object"} with a 400;
-// in that case retry once without it (extractJSON still parses the text reply).
+// servers reject response_format:{type:"json_object"} (LM Studio, ninfer) or a
+// too-large max_tokens (vLLM) with a 400; in that case retry once without the
+// offending field (extractJSON still parses a plain-text reply).
+// Local backends often can't answer the browser's CORS preflight, so when the
+// page is served by the proxy, route local-provider calls through its
+// /ideogrammar/llm/ relay (same origin => no CORS) and name the real backend
+// in a header. OpenRouter supports CORS fine, so it stays direct. A file://
+// page has no proxy to lean on and keeps the old direct behavior.
+function llmEndpoint(cfg, path) {
+  const proxied = cfg.provider === "local" && (location.protocol === "http:" || location.protocol === "https:");
+  return proxied
+    ? { url: location.origin + "/ideogrammar/llm" + path, extraHeaders: { "X-Llm-Base-Url": cfg.baseUrl } }
+    : { url: cfg.baseUrl + path, extraHeaders: {} };
+}
 async function chatCompletion(cfg, headers, body) {
-  const send = b => fetch(cfg.baseUrl + "/chat/completions", { method: "POST", headers, body: JSON.stringify(b) });
+  const ep = llmEndpoint(cfg, "/chat/completions");
+  // Reasoning models (e.g. Qwen3) spend tokens "thinking" before the answer, and
+  // some servers default to a small completion cap (ninfer: 1024) — the reply then
+  // comes back truncated or with an empty content. Always ask for enough room.
+  if (body.max_tokens == null) body = { ...body, max_tokens: 8192 };
+  const send = b => fetch(ep.url, { method: "POST", headers: Object.assign({}, headers, ep.extraHeaders), body: JSON.stringify(b) });
   const errDetail = async res => {
     try { const j = await res.json(); return j.error?.message || JSON.stringify(j.error || j); }
     catch (_) { return await res.text().catch(() => ""); }
@@ -127,8 +144,12 @@ async function chatCompletion(cfg, headers, body) {
   let res = await send(body);
   if (!res.ok) {
     const detail = await errDetail(res);
-    if (res.status === 400 && body.response_format && /response_format/i.test(detail)) {
-      const retry = { ...body }; delete retry.response_format;
+    const badFormat = body.response_format && /response_format/i.test(detail);
+    const badMaxTok = body.max_tokens != null && /max_tokens|max_completion_tokens/i.test(detail);
+    if (res.status === 400 && (badFormat || badMaxTok)) {
+      const retry = { ...body };
+      if (badFormat) delete retry.response_format;
+      if (badMaxTok) delete retry.max_tokens;
       res = await send(retry);
       if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} — ${await errDetail(res)}`);
     } else {
@@ -136,7 +157,9 @@ async function chatCompletion(cfg, headers, body) {
     }
   }
   const data = await res.json();
-  const content = data.choices?.[0]?.message?.content;
+  const choice = data.choices?.[0];
+  const content = choice?.message?.content;
+  if (choice?.finish_reason === "length") throw new Error("The model hit the completion token limit" + (content ? " and the reply is cut off" : " while still reasoning") + ". Raise the server's max output tokens, or use a model that thinks less.");
   if (!content) throw new Error("Empty response from model.");
   return content;
 }

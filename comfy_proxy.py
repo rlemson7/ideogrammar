@@ -500,6 +500,9 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/ideogrammar/refimg/"):
             self._serve_refimg(path[len("/ideogrammar/refimg/"):])
             return
+        if path.startswith("/ideogrammar/llm/"):
+            self._llm_proxy(path[len("/ideogrammar/llm"):])
+            return
         if path in ("/", "/index.html"):
             self._serve_index()
             return
@@ -516,6 +519,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if p == "/ideogrammar/refimg":
             self._store_refimg()
+            return
+        if p.startswith("/ideogrammar/llm/"):
+            self._llm_proxy(p[len("/ideogrammar/llm"):])
             return
         # POST is accepted alongside PUT so the editor can flush via
         # navigator.sendBeacon() on page unload (beacons are always POST).
@@ -539,6 +545,40 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         self._proxy()
+
+    # ---- LLM relay (same-origin escape hatch for CORS-less backends) ----
+    # Local OpenAI-compatible servers often don't answer CORS preflights, so the
+    # browser can't call them directly. The page calls /ideogrammar/llm/<path>
+    # on this proxy instead, naming the real backend in the X-Llm-Base-Url
+    # header (e.g. http://192.168.2.134:8080/v1); we forward server-to-server.
+    def _llm_proxy(self, subpath):
+        base = (self.headers.get("X-Llm-Base-Url") or "").strip().rstrip("/")
+        u = urlsplit(base)
+        if u.scheme not in ("http", "https") or not u.hostname:
+            self._json_error(400, "Missing or invalid X-Llm-Base-Url header")
+            return
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(length) if length else None
+        fwd = {"Host": u.netloc, "Accept": "application/json"}
+        for h in ("Content-Type", "Authorization", "HTTP-Referer", "X-Title"):
+            if self.headers.get(h):
+                fwd[h] = self.headers[h]
+        Conn = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+        try:
+            conn = Conn(u.hostname, u.port, timeout=ARGS.timeout)
+            conn.request(self.command, (u.path or "") + subpath, body=body, headers=fwd)
+            resp = conn.getresponse()
+            data = resp.read()
+            conn.close()
+        except Exception as e:
+            self._json_error(502, "LLM upstream error: %s" % e)
+            return
+        self.send_response(resp.status)
+        self.send_header("Content-Type", resp.getheader("Content-Type") or "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(data)
 
     # ---- transparent HTTP proxy to ComfyUI ----
     def _proxy(self):
